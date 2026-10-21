@@ -1,0 +1,41 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": ".orca-boat.json",
+  "description": "Settings a repo commits for the Boat.dev sandbox Orca plugin. Local settings (sshUser, identityFile) belong in ~/.config/orca-boat/config.json and are refused here.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "org": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._ -]*$",
+      "description": "Boat organization name or id, as listed by `boat org list`. Leave out to use the account's active org."
+    },
+    "environment": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "description": "Boat environment for new sandboxes, as listed by `boat env list`. Leave out for the account's default environment."
+    },
+    "snapshot": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "description": "Named snapshot or bsh_ share code to start sandboxes from. Leave out for boat's stock image. Only name snapshots you trust: the repo's code runs on them."
+    },
+    "machineType": {
+      "enum": ["small", "default", "large", "xlarge"],
+      "default": "default",
+      "description": "Sandbox size."
+    },
+    "setupScript": {
+      "type": "string",
+      "pattern": "^(\\./)?[A-Za-z0-9._][A-Za-z0-9._/-]*$",
+      "not": { "pattern": "(^|/)\\.\\.?(/|$)|//" },
+      "description": "Path of a script inside the repo. It runs with `bash -l` in the project folder after the checkout, and a failure fails workspace creation."
+    },
+    "ghWrapper": {
+      "type": "boolean",
+      "default": true,
+      "description": "Install the gh wrapper that keeps Orca's GitHub actions working after boat's GitHub token expires."
+    }
+  }
+}

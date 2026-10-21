@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Test double for the boat CLI. Appends its arguments to $BOAT_STUB_LOG and answers from fixture files
+# in $BOAT_STUB_DIR. A missing fixture is an error exit, like an unknown name in the real CLI.
+#
+#   boat status        -> status.json            boat env list        -> env-list.json
+#   boat org list      -> org-list.json          boat env info NAME   -> env-info-NAME.json
+#   boat <cmd> ...     -> <cmd>.json             <fixture>.rc holds a non-zero exit code
+set -u
+printf '%s\n' "$*" >>"${BOAT_STUB_LOG:?}"
+
+words=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --org) shift 2 || break ;;
+    -*) shift ;;
+    *)
+      words+=("$1")
+      shift
+      ;;
+  esac
+done
+
+reply() {
+  local fixture="$BOAT_STUB_DIR/$1" rc=0
+  if [ -f "$fixture" ]; then
+    cat "$fixture"
+    if [ -f "$fixture.rc" ]; then rc="$(cat "$fixture.rc")"; fi
+    exit "$rc"
+  fi
+  printf '{"error":"stub has no fixture %s","event":"error"}\n' "$1"
+  exit 1
+}
+
+case "${words[0]:-}" in
+  env) reply "env-${words[1]:-}${words[2]:+-${words[2]}}.json" ;;
+  org) reply "org-${words[1]:-}.json" ;;
+  *) reply "${words[0]:-none}.json" ;;
+esac

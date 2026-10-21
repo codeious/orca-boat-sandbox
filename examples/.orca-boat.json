@@ -1,0 +1,8 @@
+{
+  "$schema": "https://raw.githubusercontent.com/codeious/orca-boat-sandbox/main/schema/orca-boat.schema.json",
+  "org": "your-org",
+  "environment": "your-environment",
+  "snapshot": "your-snapshot",
+  "machineType": "default",
+  "setupScript": "scripts/boat-setup.sh"
+}

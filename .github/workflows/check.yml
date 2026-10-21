@@ -1,0 +1,34 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    # macOS runs the system bash 3.2, the oldest bash the scripts must support.
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install shellcheck and jq
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            command -v shellcheck >/dev/null || brew install shellcheck
+            command -v jq >/dev/null || brew install jq
+          else
+            command -v shellcheck >/dev/null || sudo apt-get install -y shellcheck
+            command -v jq >/dev/null || sudo apt-get install -y jq
+          fi
+      - name: Recipe is up to date and every phase is sound
+        run: node build.mjs --check
+      - name: Lint the other scripts
+        run: shellcheck -s bash src/gh-wrapper.sh examples/setup-mise-node.sh test/config-test.sh test/run-phase.sh test/stubs/boat
+      - name: Free tests
+        run: /bin/bash test/config-test.sh
