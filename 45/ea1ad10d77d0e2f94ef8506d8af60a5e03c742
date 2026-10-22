@@ -1,0 +1,27 @@
+src/create.sh
+  s_b30d531edb1211::t_2b42befa7b3759 149
+src/lib.sh
+  s_b30d531edb1211::t_e4468ae0f12b8b 225,227
+test/run-phase.sh
+  s_b30d531edb1211::t_630df66073033f 73
+.github/workflows/check.yml
+  s_b30d531edb1211::t_e3e6d3ca202aea 12
+recipes/boat-sandbox.json
+  s_b30d531edb1211::t_5423c982624886 7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "45ea1ad10d77d0e2f94ef8506d8af60a5e03c742",
+  "prompts": {},
+  "sessions": {
+    "s_b30d531edb1211": {
+      "agent_id": {
+        "tool": "droid",
+        "id": "331415b0-7fa4-4594-b383-e652f0395fc8",
+        "model": "custom:claude-sonnet-5-5"
+      },
+      "human_author": "noter <patryk@codeious.io>"
+    }
+  }
+}
