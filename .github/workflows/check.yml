@@ -9,6 +9,7 @@ jobs:
   check:
     # macOS runs the system bash 3.2, the oldest bash the scripts must support.
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}

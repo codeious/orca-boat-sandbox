@@ -70,7 +70,7 @@ remote_url="https://github.com/$slug.git"
 symref="$(git ls-remote --symref "$remote_url" HEAD)" || die "cannot read $remote_url"
 base_ref="$(printf '%s\n' "$symref" | awk '$1 == "ref:" { sub("refs/heads/", "", $2); print $2; exit }')"
 head_sha="$(printf '%s\n' "$symref" | awk '$1 != "ref:" && $2 == "HEAD" { print $1; exit }')"
-[ -n "$base_ref" ] && [ -n "$head_sha" ] || die "could not resolve the default branch of $slug"
+if [ -z "$base_ref" ] || [ -z "$head_sha" ]; then die "could not resolve the default branch of $slug"; fi
 branch="orca-boat-test-$(date +%s)"
 instance="run-phase-$$"
 log "repo $slug, base $base_ref at ${head_sha:0:12}, branch $branch, run folder $repo_path"

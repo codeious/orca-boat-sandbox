@@ -146,7 +146,7 @@ clone_deadline=$((SECONDS + 60))
 while :; do
   repo_state="$(sandbox_repo_state)"
   [ "$repo_state" = none ] || break
-  [ "$boat_clones" = 1 ] && [ "$SECONDS" -lt "$clone_deadline" ] || break
+  if [ "$boat_clones" != 1 ] || [ "$SECONDS" -ge "$clone_deadline" ]; then break; fi
   sleep 3
 done
 if [ "$repo_state" = commit ]; then

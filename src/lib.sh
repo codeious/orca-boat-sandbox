@@ -222,8 +222,9 @@ load_repo_request() {
   REPO_REF="${ORCA_REPO_REF:-}"
   REPO_HEAD="${ORCA_REPO_REF_HEAD:-}"
   REPO_BRANCH="${ORCA_REPO_BRANCH:-}"
-  [ -n "$url" ] && [ -n "$REPO_REF" ] && [ -n "$REPO_BRANCH" ] ||
+  if [ -z "$url" ] || [ -z "$REPO_REF" ] || [ -z "$REPO_BRANCH" ]; then
     die "Orca did not pass ORCA_REPO_URL, ORCA_REPO_REF and ORCA_REPO_BRANCH"
+  fi
   [[ "$REPO_HEAD" =~ ^[0-9a-f]{40}$ ]] || die "ORCA_REPO_REF_HEAD is not a full lowercase commit id"
   case "$REPO_REF" in -* | *[[:space:]]*) die "unsafe ref from Orca" ;; esac
   case "$REPO_BRANCH" in -* | *[[:space:]]*) die "unsafe branch name from Orca" ;; esac
