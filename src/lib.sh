@@ -426,13 +426,15 @@ wait_hydrated() { # id timeout_seconds
 
 # Boat restores the GitHub login (GITHUB_TOKEN, gh hosts.yml) on a resumed sandbox anywhere from
 # 0 to several minutes after it reports ready, and `hydrated` is already true by then. Probes git
-# itself, because `gh auth status` can exit non-zero while git already works. Non-fatal: without
-# the login the sandbox still runs, but git fetch and push fail.
+# itself, because `gh auth status` can exit non-zero while git already works. A new sandbox has the
+# gh login but no git credential helper until `gh auth setup-git` runs, so the probe runs it first.
+# Non-fatal: without the login the sandbox still runs, but git fetch and push fail.
 wait_github_access() { # timeout_seconds https_repo_url
   local started=$SECONDS deadline=$((SECONDS + $1))
   while :; do
     if {
       emit_exports "REPO_URL=$2"
+      echo 'if gh auth status >/dev/null 2>&1; then gh auth setup-git >/dev/null 2>&1; fi'
       # shellcheck disable=SC2016 # expands on the sandbox, from the export line above
       echo 'GIT_TERMINAL_PROMPT=0 git ls-remote --exit-code "$REPO_URL" HEAD >/dev/null 2>&1'
     } | ssh_remote 'bash -l -s'; then
@@ -440,7 +442,7 @@ wait_github_access() { # timeout_seconds https_repo_url
       return 0
     fi
     if [ "$SECONDS" -ge "$deadline" ]; then
-      log "warning: no GitHub login on the sandbox after ${1}s; git fetch and push will fail"
+      log "warning: git cannot reach GitHub from the sandbox after ${1}s (no usable GitHub login); git fetch and push will fail"
       return 1
     fi
     sleep 3

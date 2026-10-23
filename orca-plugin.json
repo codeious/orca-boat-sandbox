@@ -3,7 +3,7 @@
   "id": "boat-sandbox",
   "publisher": "codeious",
   "name": "Boat.dev Sandbox",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Runs an Orca workspace in a fresh boat.dev sandbox. Works with any Boat.dev account and any GitHub repo.",
   "repository": "https://github.com/codeious/orca-boat-sandbox",
   "engines": { "orca": ">=1.4.199" },

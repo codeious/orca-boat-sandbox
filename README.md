@@ -86,6 +86,8 @@ Commit a `.orca-boat.json` to the repo. Editors can check it with `schema/orca-b
 
 Everyone on the team who installs the plugin then gets the same sandbox. `environment` decides which repos boat clones into the sandbox; if it lists the repo, the plugin reuses that clone.
 
+For a private repo in a boat organization, the setup we tested end to end sets both `org` and an `environment` that lists the repo and passes GitHub through, with the org's new sandboxes private. If git cannot reach GitHub from the sandbox, see [Troubleshooting](#troubleshooting).
+
 ### Setup script
 
 `setupScript` names a script inside the repo. After the checkout, the plugin runs it on the sandbox with `bash -l` from the project folder. Its output goes to Orca's log. `PROJECT_ROOT`, `REPO_SLUG`, `REPO_BRANCH` and `REPO_HEAD` are set. If it exits non-zero, create fails and the sandbox is deleted.
@@ -113,7 +115,7 @@ A repo's `.orca-boat.json` can choose the org, environment, snapshot and setup s
 - **"boat is not on PATH" or "jq is not on PATH".** Install it. The plugin adds `~/.ascii/bin`, `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin` to `PATH`.
 - **"you are not logged in to boat".** Run `boat login`.
 - **Create waits a long time for GitHub.** A new sandbox can take minutes to get its GitHub login. Create waits up to 240 seconds, and only when the commit Orca pinned is not already on the sandbox. Resume waits 30 seconds and then warns; the checkout is intact, and fetch and push work once boat restores the login.
-- **"no GitHub login on the sandbox", and the create then fails.** A private repo can only be cloned once the sandbox has a GitHub login. In our tests, sandboxes in a boat org whose default visibility was `shared` had no GitHub login at all, and boat's help says sharing a sandbox wipes your personal logins from it. Put the repo in a boat environment (`boat env add-repo <env> <owner/name>`, then set `environment`), so boat clones it and the sandbox needs no login to get the code. An org admin can also try `boat org default-visibility private`, which changes the default for every member. We have not tested that. A public repo does not need the login.
+- **"git cannot reach GitHub from the sandbox", and the create then fails.** A private repo can only be cloned when the sandbox has a GitHub login that git can use. The plugin sets git up with `gh auth setup-git`, but boat has to provide the login. In our tests an org sandbox got your login when it used a boat environment that passes GitHub through (`passGithub`) and the org's new sandboxes were private. Sandboxes in an org whose default visibility was `shared` had none, and boat's help says sharing a sandbox wipes your personal logins from it. Check both: `boat env info <env>` and `boat org default-visibility` (an org admin can set it; it changes the default for every member and only affects new sandboxes). Then put the repo in that environment with `boat env add-repo <env> <owner/name>` and set `environment`. We have not found out which of the two settings matters most. A public repo does not need the login.
 - **`orca vm recipe doctor` does not list the recipe.** It cannot see plugin recipes. Create a workspace to test.
 - **Read the log.** Every step writes to Orca's recipe log. Set `ORCA_BOAT_KEEP_ON_ERROR=1` before starting Orca to keep a sandbox that failed to create.
 

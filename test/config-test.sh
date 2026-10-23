@@ -590,9 +590,22 @@ printf '1' >"$STUB_DIR/ssh-checkout.rc"
 EXTRA_ENV="$create_env ORCA_REPO_URL=git@github.com:acme/widgets.git"
 run_recipe create
 expect_fails "create fails when the checkout needs a GitHub login that never came"
-expect_has "...and warns about the missing login" "$ERR" "no GitHub login on the sandbox after 20s"
-expect_has "...and points at shared org sandboxes and environments" "$ERR" "hint: no GitHub login reached the sandbox. In a boat org whose sandboxes are shared"
+expect_has "...and warns that git cannot reach GitHub" "$ERR" "git cannot reach GitHub from the sandbox after 20s"
+expect_has "...and hints at the environment and org visibility" "$ERR" "hint: git cannot reach GitHub from the sandbox. In our tests an org sandbox got your GitHub login when its boat environment passed GitHub through"
+expect_lacks "...without telling the user to connect GitHub in the dashboard" "$ERR" "connect GitHub in the boat dashboard"
 expect_has "...and still deletes the sandbox" "$(cat "$LOG")" "delete bx_ab12cd34 --yes --json"
+
+# A new sandbox has the gh login but no git credential helper until `gh auth setup-git` runs.
+reset
+fake_sandbox
+: >"$STUB_DIR/ssh-needs-setup-git"
+EXTRA_ENV="$create_env ORCA_REPO_URL=git@github.com:acme/widgets.git"
+run_recipe create
+expect_ok "create works when git only gets credentials after gh auth setup-git"
+expect_has "...the GitHub probe sees access" "$ERR" "GitHub access is ready after"
+expect_lacks "...with no warning about GitHub access" "$ERR" "cannot reach GitHub"
+expect_eq "...and the sandbox script sets up git before it clones" "yes" "$(scripts_sent | sed -n '/^checkout_repo() {/,/^}/p' |
+  awk '/gh auth setup-git/ && !s { s = NR } /git clone/ && !c { c = NR } END { print (s && c && s < c) ? "yes" : "no" }')"
 
 reset
 fake_sandbox
@@ -617,6 +630,16 @@ expect_has "resume wakes the sandbox in its org" "$(cat "$LOG")" "--org Acme res
 expect_has "resume pins the host key" "$(cat "$HOME_DIR/.ssh/known_hosts")" "203.0.113.9 ssh-ed25519 AAAAboatkey"
 expect_has "resume reinstalls the gh wrapper by default" "$(scripts_sent)" "gh.real"
 expect_lacks "resume keeps boat's resume JSON out of the log" "$ERR" '"event":"resumed"'
+
+reset
+fake_sandbox
+: >"$STUB_DIR/ssh-needs-setup-git"
+printf '%s' "$life" | jq -c --arg k "$DEFAULT_KEY" '.recipeResult.connection.target.identityFile = $k' >"$TMP/payload"
+STDIN_FILE="$TMP/payload"
+run_recipe resume
+expect_ok "resume works when git only gets credentials after gh auth setup-git"
+expect_has "...the GitHub probe sees access" "$ERR" "GitHub access is ready after"
+expect_lacks "...with no warning about GitHub access" "$ERR" "cannot reach GitHub"
 
 reset
 fake_sandbox

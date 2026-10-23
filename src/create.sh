@@ -30,12 +30,14 @@ checkout_repo() {
   if [ "$ENV_CLONES_REPO" = 1 ]; then
     wait_for_boat_clone || echo "warning: boat's clone of $REPO_SLUG never appeared; cloning it here" >&2
   fi
+  # git has no credential helper on a new sandbox until this runs, and a private clone needs it.
+  if gh auth status >/dev/null 2>&1; then gh auth setup-git; fi
 
   if [ ! -d "$PROJECT_ROOT/.git" ]; then
     [ ! -e "$PROJECT_ROOT" ] || [ -z "$(ls -A "$PROJECT_ROOT" 2>/dev/null)" ] ||
       fail "$PROJECT_ROOT exists and is not a git checkout; not touching it"
     [ "$GITHUB_READY" = 1 ] ||
-      fail "$REPO_SLUG is not on the sandbox and its GitHub login did not appear; connect GitHub in the boat dashboard"
+      fail "$REPO_SLUG is not on the sandbox and git cannot reach GitHub from it (see Troubleshooting in the plugin README)"
     step "cloning $REPO_SLUG"
     git clone --no-checkout "$REPO_URL" "$PROJECT_ROOT"
   fi
@@ -51,14 +53,13 @@ checkout_repo() {
     git remote set-url origin "$REPO_URL"
   fi
 
-  if gh auth status >/dev/null 2>&1; then gh auth setup-git; fi
   step "fetching $REPO_REF"
   # git can echo the remote URL in its errors, and that URL may hold a token, so its output is dropped.
   if ! git fetch -q origin "$REPO_REF" >/dev/null 2>&1; then
-    echo "warning: git fetch failed (the sandbox's GitHub login is probably not back yet); using what is already here" >&2
+    echo "warning: git fetch failed (git cannot reach GitHub from the sandbox yet); using what is already here" >&2
   fi
   git cat-file -e "${REPO_HEAD}^{commit}" 2>/dev/null ||
-    fail "commit ${REPO_HEAD} is not in the sandbox checkout and could not be fetched; connect GitHub in the boat dashboard"
+    fail "commit ${REPO_HEAD} is not in the sandbox checkout and could not be fetched (see Troubleshooting in the plugin README)"
   git checkout -q -B "$REPO_BRANCH" "$REPO_HEAD"
 }
 
@@ -166,7 +167,7 @@ wait_github_access "$github_wait" "$REPO_HTTPS_URL" || github_ready=0
 } | ssh_remote 'bash -l -s' >&2 || {
   rc=$?
   if [ "$github_ready" = 0 ]; then
-    log "hint: no GitHub login reached the sandbox. In a boat org whose sandboxes are shared, boat keeps your personal logins off them; put the repo in a boat environment so boat clones it, or see Troubleshooting in the plugin README"
+    log "hint: git cannot reach GitHub from the sandbox. In our tests an org sandbox got your GitHub login when its boat environment passed GitHub through and the org's new sandboxes were private; see Troubleshooting in the plugin README"
   fi
   exit "$rc"
 }
