@@ -1,0 +1,40 @@
+orca-plugin.json
+  s_b30d531edb1211::t_f6eaf870e8eb53 6
+test/stubs/ssh
+  s_b30d531edb1211::t_3f24b904254344 7-8
+  s_b30d531edb1211::t_603e183ddf6ad6 30-33
+CHANGELOG.md
+  s_b30d531edb1211::t_0bdcb2b2d025e1 3-7
+src/lib.sh
+  s_b30d531edb1211::t_edd36bb792b950 445
+  s_b30d531edb1211::t_7dd5dab77de8ca 429-431,437
+src/create.sh
+  s_b30d531edb1211::t_e930c8255f184c 59,62
+  s_b30d531edb1211::t_06993559e9c23b 33-34,40
+  s_b30d531edb1211::t_8163b609448a42 170
+README.md
+  s_b30d531edb1211::t_065421235ca69f 89-90
+  s_b30d531edb1211::t_abad8be2119423 118
+test/config-test.sh
+  s_b30d531edb1211::t_e13ba909b77b45 593-595,598-608,634-635
+  s_b30d531edb1211::t_1c1156c55db6d3 636-643
+  s_b30d531edb1211::t_93b7601688ec27 609
+recipes/boat-sandbox.json
+  s_b30d531edb1211::t_98c6a0ace5486b 7,9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6f08516443836400d35b1263a179c339421fa647",
+  "prompts": {},
+  "sessions": {
+    "s_b30d531edb1211": {
+      "agent_id": {
+        "tool": "droid",
+        "id": "331415b0-7fa4-4594-b383-e652f0395fc8",
+        "model": "custom:claude-sonnet-5-5"
+      },
+      "human_author": "noter <patryk@codeious.io>"
+    }
+  }
+}
