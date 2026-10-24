@@ -1,0 +1,19 @@
+README.md
+  s_5dc2023acb4c1c::t_4b38690d990f5d 161,182-185
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3c3877e7552e87d348c23700b4d35968710acc5e",
+  "prompts": {},
+  "sessions": {
+    "s_5dc2023acb4c1c": {
+      "agent_id": {
+        "tool": "droid",
+        "id": "b0cbf50c-cb40-4a9d-b421-9c2bc5fbe5cd",
+        "model": "custom:claude-sonnet-5-5"
+      },
+      "human_author": "noter <patryk@codeious.io>"
+    }
+  }
+}
