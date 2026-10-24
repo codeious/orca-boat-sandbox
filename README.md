@@ -158,6 +158,7 @@ What matters for Droid in a sandbox:
 - **Keep the file valid JSON.** Orca adds its own status hooks to `~/.factory/settings.json` when it connects. Do not set `hooksDisabled`, or Orca cannot show the agent's state.
 - **Pre-trust the folders.** Droid asks "Trust this folder?" once per folder. The repo is at `/home/user/<repo name>`, so list those folders under `trustedFolders`. Also list `/var/lib/ascii-lazy/retired/home`. When boat finishes restoring a sandbox's files, a process that was already inside `/home/user` sees its folder under that path, and Droid asks again.
 - **Remember the key is readable.** Anyone who runs code in the sandbox can read the key variable.
+- **Pre-install plugins with Droid 0.248.0.** To bake Droid plugins into a [tools snapshot](#building-a-tools-snapshot) without signing in, install them with that version. Droid 0.249.0 refuses `droid plugin install` without a Factory login. Plugins installed this way keep loading after Droid updates itself.
 
 ## Building a tools snapshot
 
@@ -178,6 +179,10 @@ Rules we learned by testing:
 
 - **Never build from `boat new --no-env`.** Boat then withholds logins from every sandbox created from that snapshot, even when its environment passes GitHub through. Build from an environment with every toggle off, as above. `boat info <id> --json` should show `"holdsCreatorLogins": false` for the build sandbox and `true` for your workspaces.
 - **Put tools in `/usr/local/bin`.** `boat ssh` and `boat exec` start shells that do not read `~/.profile`, so a tool only in `~/.local/bin` is "command not found" there. Install it there or link it: `sudo ln -s ~/.local/bin/<tool> /usr/local/bin/<tool>`.
+- **Keep shell setup out of `~/.bashrc`.** Boat writes `~/.bashrc` when a sandbox starts. Put your own setup in `/etc/bash.bashrc`, which interactive shells read and which `bash -c` from `boat ssh` also reads if you add it above the file's interactive guard. For login shells, use the end of `~/.profile`. To activate mise, for example:
+  - put `eval "$(mise activate bash)"` in `/etc/bash.bashrc` for interactive shells
+  - put `eval "$(mise activate bash --shims)"` in `/etc/bash.bashrc` for every other shell
+  - at the end of `~/.profile`, move `~/.local/share/mise/shims` to the front of `PATH` yourself; `mise activate --shims` does not move it when an outer shell already added it, and `~/.profile` may have put nvm's node ahead of it
 - **Keep credentials and repos out.** Do not sign in to anything during the build. The environment adds logins per workspace.
 
 Saving under an existing name replaces the snapshot. Workspaces that already exist keep their disk.
