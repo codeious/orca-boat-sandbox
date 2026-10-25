@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# Marks a boat workspace in Orca as needing a wake. Use it when boat restarted a sandbox while Orca
+# showed the workspace as running: the sandbox has a new address, Orca keeps retrying the old one,
+# and Orca runs the plugin's resume only for a workspace that is asleep or whose last wake failed.
+# This marks the wake as failed, so clicking the workspace in Orca's sidebar runs resume, which
+# returns the new address and, for workspaces created with plugin 1.0.3 or later, puts back the
+# machine ID Orca's server on the sandbox belongs to.
+#
+#   orca-boat-wake                                list Orca's boat workspaces
+#   orca-boat-wake [--dry-run] <bx_id | name>     mark one for a wake
+#
+#   --store FILE   Orca's orca-ephemeral-vm-runtimes.json (default: the one in Orca's folder)
+#   --dry-run      show what would change and change nothing
+#
+# Needs jq. Backs the file up first and changes only that workspace's status.
+set -euo pipefail
+
+export PATH="$HOME/.ascii/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+export BOAT_NO_UPDATE=true
+
+usage() {
+  sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//' >&2
+  exit 2
+}
+die() {
+  printf 'orca-boat-wake: %s\n' "$*" >&2
+  exit 1
+}
+
+default_store() {
+  case "$(uname -s)" in
+    Darwin) printf '%s' "$HOME/Library/Application Support/Orca/orca-ephemeral-vm-runtimes.json" ;;
+    *) printf '%s' "${XDG_CONFIG_HOME:-$HOME/.config}/Orca/orca-ephemeral-vm-runtimes.json" ;;
+  esac
+}
+
+store="" dry_run=0 want=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --store)
+      store="${2:?--store needs a file}"
+      shift
+      ;;
+    --dry-run) dry_run=1 ;;
+    -h | --help) usage ;;
+    -*) usage ;;
+    *)
+      [ -z "$want" ] || usage
+      want="$1"
+      ;;
+  esac
+  shift
+done
+command -v jq >/dev/null 2>&1 || die "jq is not on PATH"
+[ -n "$store" ] || store="$(default_store)"
+[ -f "$store" ] || die "no Orca runtime file at $store; pass the right one with --store FILE"
+jq -e '.runtimes | type == "array"' "$store" >/dev/null 2>&1 || die "$store is not an Orca runtime file"
+
+# Records of deleted sandboxes stay as "cleaned"; they are never the one meant.
+BOAT='.runtimes[] | select(.recipeResult.userData.provider == "boat" and .status != "cleaned")'
+ADDRESS='(.recipeResult.connection.target // {}) | "\(.host // "-"):\(.port // "-")"'
+
+if [ -z "$want" ]; then
+  {
+    printf 'WORKSPACE\tSANDBOX\tSTATUS\tADDRESS IN ORCA\n'
+    jq -r "$BOAT | [.workspaceName // \"-\", .recipeResult.userData.resourceId // \"-\", .status, ($ADDRESS)] | @tsv" "$store"
+  } | awk -F '\t' '{ printf "%-28s %-12s %-14s %s\n", $1, $2, $3, $4 }'
+  exit 0
+fi
+
+matches="$(jq -c --arg w "$want" "[$BOAT | select(.recipeResult.userData.resourceId == \$w or .workspaceName == \$w)]" "$store")"
+count="$(printf '%s' "$matches" | jq 'length')"
+[ "$count" -gt 0 ] || die "no boat workspace '$want' in $store; run without arguments to list them"
+[ "$count" -eq 1 ] || die "$count boat workspaces match '$want'; use the sandbox id (bx_...) instead"
+record="$(printf '%s' "$matches" | jq -c '.[0]')"
+field() { printf '%s' "$record" | jq -r "$1"; }
+runtime_id="$(field .id)"
+name="$(field '.workspaceName // "-"')"
+sandbox="$(field '.recipeResult.userData.resourceId // empty')"
+org="$(field '.recipeResult.userData.org // empty')"
+status="$(field .status)"
+orca_address="$(field "$ADDRESS")"
+
+case "$status" in
+  running) ;;
+  suspended | resume_failed)
+    echo "'$name' ($sandbox) is $status, so Orca already wakes it: click it in Orca's sidebar."
+    exit 0
+    ;;
+  *) die "'$name' ($sandbox) is $status in Orca; this only changes a workspace Orca shows as running" ;;
+esac
+
+# Only for the user to compare; boat being unreachable changes nothing here.
+if command -v boat >/dev/null 2>&1 && [ -n "$sandbox" ]; then
+  if [ -n "$org" ]; then info="$(boat --org "$org" info "$sandbox" --json 2>/dev/null || true)"; else info="$(boat info "$sandbox" --json 2>/dev/null || true)"; fi
+  boat_view="$(printf '%s' "$info" | jq -r '.sandbox // empty
+    | "\(.state // "unknown"), address \(.sshEndpoint // ((.ip // "-") + ":22"))"' 2>/dev/null || true)"
+  if [ -n "$boat_view" ]; then echo "boat: $sandbox is $boat_view; Orca has $orca_address"; fi
+fi
+
+if [ "$dry_run" = 1 ]; then
+  echo "dry run: would mark '$name' ($sandbox) in $store for a wake (status running -> resume_failed)"
+  exit 0
+fi
+
+umask 077
+backup="$store.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+cp -p "$store" "$backup"
+tmp="$(mktemp "$store.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
+jq --arg id "$runtime_id" --argjson now "$(($(date +%s) * 1000))" '
+  .runtimes |= map(if .id == $id and .status == "running" then .status = "resume_failed" | .updatedAt = $now else . end)' \
+  "$store" >"$tmp"
+chmod 600 "$tmp"
+mv -f "$tmp" "$store"
+trap - EXIT
+[ "$(jq -r --arg id "$runtime_id" '.runtimes[] | select(.id == $id) | .status' "$store")" = resume_failed ] ||
+  die "Orca changed the file at the same moment; run this again (backup: $backup)"
+echo "marked '$name' ($sandbox) for a wake; backup: $backup"
+echo "Now click '$name' in Orca's sidebar. Click that workspace itself: another worktree of the same repo does not wake the sandbox."

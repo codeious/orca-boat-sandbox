@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Free tests: no network and no boat account. boat is a stub (test/stubs/boat), HOME is a temp dir.
 # Covers config precedence, what a repo file may set, repo URL checks, preflight, lifecycle parsing,
-# failure cleanup, and the generated recipe commands run the way Orca runs them (`sh -c`, stdin).
+# failure cleanup, the sandbox's git identity and machine-ID scripts, the generated recipe commands
+# run the way Orca runs them (`sh -c`, stdin), and bin/orca-boat-wake.
 #
 #   bash test/config-test.sh
 # shellcheck disable=SC2016 # the snippets handed to lib_eval expand in the child shell, not here
@@ -548,6 +549,133 @@ set_git_identity"
   expect_has "...it warns instead" "$ERR" "warning: could not set git user.name"
 fi
 
+# --- machine ID -----------------------------------------------------------------------------------
+# The sandbox side, run here with HOME at a fake sandbox home, a fake /etc/machine-id, and `env` for sudo.
+ID_A=659be28af4084d23809658cc30ee9edc
+ID_B=42011eef27414e07b681552fb7fd6fb9
+ID_C=0123456789abcdef0123456789abcdef
+MID_FILE="$TMP/machine-id"
+MID_LIST="$SANDBOX_HOME/.local/state/orca-boat/machine-ids"
+key_of() { printf 'linux:%s' "$1" | shasum -a 256 | cut -c1-16; }
+set_machine_id() {
+  rm -f "$MID_FILE"
+  printf '%s\n' "$1" >"$MID_FILE"
+  chmod 444 "$MID_FILE"
+}
+orca_claim() { # key [pretty]; Orca itself writes one compact line
+  mkdir -p "$SANDBOX_HOME/.orca-remote"
+  if [ "${2:-}" = pretty ]; then
+    printf '{\n  "schemaVersion": 1,\n  "machineKey": "%s"\n}\n' "$1"
+  else
+    printf '{"schemaVersion":1,"machineKey":"%s"}' "$1"
+  fi >"$SANDBOX_HOME/.orca-remote/orcad-machine.json"
+}
+reset
+lib_eval 'machine_id_record_script; machine_id_restore_script'
+mid_scripts="$OUT"
+# Sets OUT, ERR and RC. MID_SUDO stands in for `sudo -n`.
+on_machine() { # script
+  RC=0
+  OUT="$(env -i PATH="$BASE_PATH" HOME="$SANDBOX_HOME" ORCA_BOAT_MACHINE_ID_FILE="$MID_FILE" \
+    ORCA_BOAT_SUDO="${MID_SUDO:-env}" bash -c "$mid_scripts
+$1" 2>"$TMP/err")" || RC=$?
+  ERR="$(cat "$TMP/err")"
+}
+# A process that looks like an Orca server: its first argument is the path.
+fake_server() { # path -> FAKE_PID
+  bash -c 'exec -a "$1" sleep 8' _ "$1" &
+  FAKE_PID=$!
+}
+ended_by_signal() { # pid -> yes when it was killed
+  local rc=0
+  wait "$1" 2>/dev/null || rc=$?
+  if [ "$rc" -gt 128 ]; then echo yes; else echo no; fi
+}
+
+if command -v shellcheck >/dev/null 2>&1; then
+  printf '%s\n' "$mid_scripts" >"$TMP/mid.sh"
+  RC=0
+  ERR="$(shellcheck -s bash -e SC2034 "$TMP/mid.sh" 2>&1)" || RC=$?
+  expect_ok "the sandbox machine-ID scripts pass shellcheck"
+fi
+
+on_machine 'mid_key '"$ID_A"
+expect_eq "machine key matches what Orca wrote for a real sandbox" "567f735089a3e9ab" "$OUT"
+
+new_sandbox_home
+set_machine_id "$ID_A"
+on_machine 'set -euo pipefail; record_machine_id; record_machine_id'
+expect_ok "record_machine_id runs under set -euo pipefail"
+expect_eq "...and lists the machine ID once" "$ID_A" "$(cat "$MID_LIST")"
+
+new_sandbox_home
+set_machine_id "not-a-machine-id"
+on_machine 'set -euo pipefail; record_machine_id; echo after'
+expect_eq "an unreadable machine ID does not stop the script" "after" "$OUT"
+expect_has "...it warns" "$ERR" "could not record the machine ID"
+
+new_sandbox_home
+set_machine_id "$ID_A"
+chmod 644 "$MID_FILE"
+on_machine 'for i in $(seq 10 34); do printf "%s\n" "0123456789abcdef0123456789abcd$i" >"$mid_file"; record_machine_id; done'
+expect_eq "the list keeps the 20 newest machine IDs" "20|0123456789abcdef0123456789abcd34" \
+  "$(wc -l <"$MID_LIST" | tr -d ' ')|$(tail -n 1 "$MID_LIST")"
+
+new_sandbox_home
+set_machine_id "$ID_B"
+on_machine 'restore_machine_id'
+expect_eq "no Orca server yet: nothing to restore" "none" "$OUT"
+expect_eq "...the machine ID is recorded" "$ID_B" "$(cat "$MID_LIST")"
+
+new_sandbox_home
+set_machine_id "$ID_A"
+orca_claim "$(key_of "$ID_A")"
+on_machine 'restore_machine_id'
+expect_eq "Orca's server belongs to the current machine ID" "same" "$OUT"
+expect_eq "...which is left alone" "$ID_A" "$(cat "$MID_FILE")"
+
+# boat restarted the sandbox: the machine ID went from A to B, and Orca already started a second
+# server under B.
+new_sandbox_home
+mkdir -p "$(dirname "$MID_LIST")"
+printf '%s\n' "$ID_C" "$ID_A" >"$MID_LIST"
+set_machine_id "$ID_B"
+orca_claim "$(key_of "$ID_A")" pretty
+fake_server "$SANDBOX_HOME/.orca-remote/hosts/$(key_of "$ID_B")/.orca-remote/orcad-0.1.0/bin/orcad"
+stray_pid=$FAKE_PID
+fake_server "$SANDBOX_HOME/.orca-remote/orcad-0.1.0/bin/orcad"
+home_pid=$FAKE_PID
+fake_server "$SANDBOX_HOME/.orca-remote/hosts/$(key_of "$ID_C")/.orca-remote/orcad-0.1.0/bin/orcad"
+other_pid=$FAKE_PID
+on_machine 'set -euo pipefail; restore_machine_id'
+expect_eq "the machine ID Orca's server belongs to is put back" "restored|$ID_A" "$OUT|$(cat "$MID_FILE")"
+expect_eq "...read-only, as boat left it" "$MID_FILE" "$(find "$MID_FILE" -perm 0444)"
+expect_eq "...boat's ID is listed, and the restored one is newest" "$ID_C $ID_B $ID_A" "$(tr '\n' ' ' <"$MID_LIST" | sed 's/ $//')"
+expect_eq "...the server started under boat's ID is stopped" "yes" "$(ended_by_signal "$stray_pid")"
+expect_eq "...Orca's own server is not" "alive" "$(if kill -0 "$home_pid" 2>/dev/null; then echo alive; else echo gone; fi)"
+expect_eq "...nor a server under another machine ID" "alive" "$(if kill -0 "$other_pid" 2>/dev/null; then echo alive; else echo gone; fi)"
+expect_has "...and it says so" "$ERR" "stopping the Orca server set up under boat's new machine ID"
+kill "$home_pid" "$other_pid" 2>/dev/null || true
+wait "$home_pid" "$other_pid" 2>/dev/null || true
+
+new_sandbox_home
+mkdir -p "$(dirname "$MID_LIST")"
+printf '%s\n' "$ID_C" "$(printf '%s' "$ID_A" | tr '[:lower:]' '[:upper:]')" "garbage" >"$MID_LIST"
+set_machine_id "$ID_B"
+orca_claim "$(key_of "$ID_A")"
+on_machine 'restore_machine_id'
+expect_eq "no listed machine ID matches Orca's server" "unknown" "$OUT"
+expect_eq "...so the machine ID is left alone" "$ID_B" "$(cat "$MID_FILE")"
+expect_eq "...and boat's ID is listed" "$ID_B" "$(tail -n 1 "$MID_LIST")"
+
+new_sandbox_home
+mkdir -p "$(dirname "$MID_LIST")"
+printf '%s\n' "$ID_A" >"$MID_LIST"
+set_machine_id "$ID_B"
+orca_claim "$(key_of "$ID_A")"
+MID_SUDO=false on_machine 'set -euo pipefail; restore_machine_id'
+expect_eq "without sudo the restore reports failed" "failed" "$OUT"
+expect_eq "...and the machine ID is unchanged" "$ID_B" "$(cat "$MID_FILE")"
 # --- host keys ----------------------------------------------------------------------------------
 reset
 lib_eval 'KNOWN_HOSTS="$HOME/.ssh/known_hosts"
@@ -697,6 +825,11 @@ expect_eq "...records it for resume" "true" \
 expect_eq "...and sets it after the checkout and before the setup script" "yes" "$(scripts_sent | sed -n '/^main() {/,/^}/p' |
   awk '/checkout_repo/ && !c { c = NR } /set_git_identity/ && !g { g = NR } /run_setup_script/ && !s { s = NR }
     END { print (c && g && s && c < g && g < s) ? "yes" : "no" }')"
+expect_has "...records the machine ID" "$(scripts_sent)" "record_machine_id() {"
+expect_eq "...after the git identity and before the setup script" "yes" "$(scripts_sent | sed -n '/^main() {/,/^}/p' |
+  awk '/set_git_identity/ && !g { g = NR } /record_machine_id/ && !m { m = NR } /run_setup_script/ && !s { s = NR }
+    END { print (g && m && s && g < m && m < s) ? "yes" : "no" }')"
+expect_lacks "...but restores nothing" "$(scripts_sent)" "restore_machine_id"
 
 reset
 fake_sandbox
@@ -773,6 +906,8 @@ expect_has "resume pins the host key" "$(cat "$HOME_DIR/.ssh/known_hosts")" "203
 expect_has "resume reinstalls the gh wrapper by default" "$(scripts_sent)" "gh.real"
 expect_lacks "resume keeps boat's resume JSON out of the log" "$ERR" '"event":"resumed"'
 expect_lacks "resume of a sandbox created without a git identity leaves git alone" "$(scripts_sent)" "set_git_identity"
+expect_has "resume checks the machine ID" "$(scripts_sent)" "restore_machine_id"
+expect_lacks "...quietly when it is unchanged" "$ERR" "machine ID"
 
 reset
 fake_sandbox
@@ -785,6 +920,33 @@ expect_has "...puts it back where the sandbox lost it" "$(scripts_sent)" "set_gi
 expect_has "...from what create recorded" "$(scripts_sent)" 'export GIT_NAME=Ada\ Lovelace'
 expect_eq "...and keeps it for the next resume" "true" \
   "$(printf '%s' "$OUT" | jq '.userData.gitName == "Ada Lovelace" and .userData.gitEmail == "ada@example.com"')"
+expect_eq "...the machine ID is checked before the git identity is" "yes" "$(scripts_sent |
+  awk '/^restore_machine_id$/ && !m { m = NR } /^set_git_identity$/ && !g { g = NR } END { print (m && g && m < g) ? "yes" : "no" }')"
+
+resume_with_machine_id() { # stub output [rc]
+  reset
+  fake_sandbox
+  printf '%s\n' "$1" >"$STUB_DIR/ssh-machine-id.out"
+  printf '%s' "${2:-0}" >"$STUB_DIR/ssh-machine-id.rc"
+  printf '%s' "$life" | jq -c --arg k "$DEFAULT_KEY" '.recipeResult.connection.target.identityFile = $k' >"$TMP/payload"
+  STDIN_FILE="$TMP/payload"
+  run_recipe resume
+}
+resume_with_machine_id restored
+expect_ok "resume after boat changed the machine ID"
+expect_has "...says it put the old one back" "$ERR" "put back the machine ID Orca's server on the sandbox belongs to"
+resume_with_machine_id failed
+expect_ok "resume still wakes the workspace when the machine ID cannot be put back"
+expect_eq "...with its usual result" "yes" "$(if is_one_json_line "$OUT"; then echo yes; else echo no; fi)"
+expect_has "...and a warning" "$ERR" "warning: boat changed the sandbox's machine ID and it could not be put back"
+resume_with_machine_id unknown
+expect_has "resume warns when no listed machine ID matches" "$ERR" "see Troubleshooting in the plugin README"
+resume_with_machine_id "" 255
+expect_ok "resume still wakes the workspace when the machine-ID check cannot run"
+expect_has "...and says so" "$ERR" "warning: could not check the sandbox's machine ID"
+printf 'Last login: today\nsame\n' >"$TMP/two-lines"
+resume_with_machine_id "$(cat "$TMP/two-lines")"
+expect_lacks "resume reads only the last line of the check" "$ERR" "machine ID"
 
 reset
 fake_sandbox
@@ -806,5 +968,93 @@ expect_fails "resume fails when boat resume fails"
 expect_has "...and shows boat's own output" "$ERR" "boat resume failed: {\"event\":\"resumed\"}"
 expect_eq "...with nothing on stdout" "" "$OUT"
 
+# --- bin/orca-boat-wake -------------------------------------------------------------------------
+STORE="$TMP/orca/orca-ephemeral-vm-runtimes.json"
+boat_runtime() { # id status name sandbox [provider]
+  printf '{"id":"%s","status":"%s","workspaceName":"%s","createdAt":1,"updatedAt":1,"recipeResult":{"schemaVersion":2,"connection":{"type":"ssh","target":{"host":"203.0.113.9","port":19044}},"userData":{"provider":"%s","resourceId":"%s","org":"Acme"}}}' \
+    "$1" "$2" "$3" "${5:-boat}" "$4"
+}
+new_store() {
+  rm -rf "$TMP/orca"
+  mkdir -p "$TMP/orca"
+  printf '{"version":1,"runtimes":[%s,%s,%s,%s,%s,%s,%s]}\n' \
+    "$(boat_runtime orca-1 running refactor bx_ab12cd34)" \
+    "$(boat_runtime orca-2 suspended sleepy bx_cd34ef56)" \
+    "$(boat_runtime orca-3 running refactor x other)" \
+    "$(boat_runtime orca-4 cleaned refactor bx_zz99zz99)" \
+    "$(boat_runtime orca-5 running twin bx_11111111)" \
+    "$(boat_runtime orca-6 running twin bx_22222222)" \
+    "$(boat_runtime orca-7 failed broken bx_33333333)" >"$STORE"
+  chmod 600 "$STORE"
+  cp "$STORE" "$TMP/store-before"
+}
+wake() { # args...
+  RC=0
+  OUT="$(env -i PATH="$BASE_PATH" HOME="$HOME_DIR" BOAT_STUB_DIR="$STUB_DIR" BOAT_STUB_LOG="$LOG" \
+    bash "$ROOT/bin/orca-boat-wake" --store "$STORE" "$@" 2>"$TMP/err")" || RC=$?
+  ERR="$(cat "$TMP/err")"
+}
+status_of() { jq -r --arg id "$1" '.runtimes[] | select(.id == $id) | .status' "$STORE"; }
+others_of() { jq -S --arg id "$1" '[.runtimes[] | select(.id != $id)]' "$2"; }
+store_unchanged() { cmp -s "$STORE" "$TMP/store-before" && echo yes || echo no; }
+backups() { find "$TMP/orca" -name '*.bak-*' | wc -l | tr -d ' '; }
+
+reset
+new_store
+wake
+expect_ok "wake helper lists Orca's boat workspaces"
+expect_has "...with sandbox, status and the address Orca has" "$OUT" "bx_ab12cd34  running        203.0.113.9:19044"
+expect_has "...including one that is asleep" "$OUT" "sleepy"
+expect_lacks "...but not other recipes' workspaces" "$OUT" " x "
+expect_lacks "...nor deleted sandboxes" "$OUT" "bx_zz99zz99"
+expect_eq "...and changes nothing" "yes" "$(store_unchanged)"
+
+reset
+new_store
+fixture info.json '{"sandbox":{"state":"ready","sshEndpoint":"198.51.100.7:19041"}}'
+wake refactor
+expect_ok "wake helper marks a running workspace by name"
+expect_eq "...as needing a wake" "resume_failed" "$(status_of orca-1)"
+expect_eq "...with a new updatedAt" "true" "$(jq '.runtimes[] | select(.id == "orca-1") | .updatedAt > 1' "$STORE")"
+expect_eq "...and leaves every other record as it was" "$(others_of orca-1 "$TMP/store-before")" "$(others_of orca-1 "$STORE")"
+expect_eq "...keeps the file private" "$STORE" "$(find "$STORE" -perm 0600)"
+expect_eq "...after a backup of the original" "yes" \
+  "$(cmp -s "$(find "$TMP/orca" -name '*.bak-*')" "$TMP/store-before" && echo yes || echo no)"
+expect_has "...shows boat's address next to Orca's" "$OUT" "boat: bx_ab12cd34 is ready, address 198.51.100.7:19041; Orca has 203.0.113.9:19044"
+expect_has "...asking boat in the workspace's org" "$(cat "$LOG")" "--org Acme info bx_ab12cd34 --json"
+expect_has "...and says what to click" "$OUT" "Now click 'refactor' in Orca's sidebar"
+
+reset
+new_store
+wake bx_ab12cd34
+expect_eq "wake helper marks a workspace by sandbox id" "resume_failed" "$(status_of orca-1)"
+
+reset
+new_store
+wake --dry-run refactor
+expect_ok "wake helper --dry-run"
+expect_has "...says what it would do" "$OUT" "dry run: would mark 'refactor'"
+expect_eq "...and changes nothing" "yes|0" "$(store_unchanged)|$(backups)"
+
+reset
+new_store
+wake twin
+expect_fails "wake helper refuses a name two workspaces share"
+expect_has "...and asks for the sandbox id" "$ERR" "use the sandbox id"
+wake nope
+expect_fails "wake helper refuses an unknown workspace"
+wake broken
+expect_fails "wake helper refuses a workspace that is not running"
+expect_eq "...and none of these changed the file" "yes|0" "$(store_unchanged)|$(backups)"
+wake sleepy
+expect_ok "wake helper leaves an asleep workspace alone"
+expect_has "...and says clicking it wakes it" "$OUT" "click it in Orca's sidebar"
+expect_eq "...without touching the file" "yes" "$(store_unchanged)"
+
+reset
+RC=0
+ERR="$(env -i PATH="$BASE_PATH" HOME="$HOME_DIR" bash "$ROOT/bin/orca-boat-wake" --store "$TMP/missing.json" 2>&1)" || RC=$?
+expect_fails "wake helper without Orca's file fails"
+expect_has "...and names --store" "$ERR" "--store FILE"
 printf '\n%s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]

@@ -10,6 +10,9 @@
 #   --repo-path DIR      run from DIR, so its .orca-boat.json applies (default: an empty folder,
 #                        which means stock settings)
 #   --remote-check CMD   also run CMD in the project folder on the sandbox, with `bash -l`
+#   --simulate-machine-id-change
+#                        after create, write an Orca server claim for the machine ID and then change
+#                        the ID, as boat does on a restart; resume must put the original back
 #   --keep               do not destroy the sandbox at the end; prints how to delete it
 #   --dry-run            print what would run and exit; costs nothing
 #
@@ -29,12 +32,13 @@ die() {
   exit 1
 }
 
-confirmed=0 dry_run=0 keep=0 slug="" repo_path="" remote_check=""
+confirmed=0 dry_run=0 keep=0 slug="" repo_path="" remote_check="" simulate_mid=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --confirm-paid) confirmed=1 ;;
     --dry-run) dry_run=1 ;;
     --keep) keep=1 ;;
+    --simulate-machine-id-change) simulate_mid=1 ;;
     --repo-path)
       repo_path="${2:?--repo-path needs a folder}"
       shift
@@ -159,6 +163,52 @@ check_checkout() {
   fi
 }
 
+# Runs a command on the sandbox the way Orca connects: the pinned key, the identity from the result.
+sandbox_ssh() { # remote command...
+  ssh -p "$(jq -r '.connection.target.port' "$result")" -i "$(jq -r '.connection.target.identityFile' "$result")" \
+    -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20 \
+    "$(jq -r '.connection.target.username' "$result")@$(jq -r '.connection.target.host' "$result")" "$@"
+}
+
+# Stands in for Orca and boat after create: Orca's claim for the machine ID create recorded, the way
+# Orca writes ~/.orca-remote/orcad-machine.json, then a new machine ID, as boat gives a restarted sandbox.
+# The heredoc lives in a function because bash 3.2 cannot parse one inside $( ).
+machine_id_change_script() {
+  cat <<'REMOTE'
+set -euo pipefail
+orig="$(cat /etc/machine-id)"
+grep -qxF "$orig" "$HOME/.local/state/orca-boat/machine-ids" || { echo "create did not record the machine ID" >&2; exit 3; }
+mkdir -p "$HOME/.orca-remote"
+printf '{"schemaVersion":1,"machineKey":"%s"}' "$(printf 'linux:%s' "$orig" | sha256sum | cut -c1-16)" \
+  >"$HOME/.orca-remote/orcad-machine.json"
+new="$(tr -d '-' </proc/sys/kernel/random/uuid)"
+printf '%s\n' "$new" | sudo -n tee /etc/machine-id >/dev/null
+printf '%s %s\n' "$orig" "$new"
+REMOTE
+}
+
+simulate_machine_id_change() {
+  local out
+  out="$(machine_id_change_script | sandbox_ssh 'bash -s')" || die "could not simulate a machine-ID change"
+  machine_id_orig="${out%% *}"
+  machine_id_fake="${out##* }"
+  log "machine ID ${machine_id_orig:0:8}... recorded by create; replaced it with ${machine_id_fake:0:8}..."
+}
+
+check_machine_id() {
+  local out now seen
+  out="$(sandbox_ssh 'cat /etc/machine-id; tail -n 2 ~/.local/state/orca-boat/machine-ids | head -n 1')" ||
+    die "could not read the machine ID"
+  now="$(printf '%s\n' "$out" | sed -n 1p)"
+  seen="$(printf '%s\n' "$out" | sed -n 2p)"
+  [ "$now" = "$machine_id_orig" ] || die "resume did not put back the machine ID (it is ${now:0:8}...)"
+  if [ "$seen" = "$machine_id_fake" ]; then
+    log "resume put back the machine ID; boat kept the one set before suspend"
+  else
+    log "resume put back the machine ID; boat had given the sandbox a new one (${seen:0:8}...) on start"
+  fi
+}
+
 timed() { # label command...
   local label="$1" started=$SECONDS
   shift
@@ -180,7 +230,9 @@ phase_resume() {
 
 timed create phase_create
 check_checkout
+if [ "$simulate_mid" = 1 ]; then simulate_machine_id_change; fi
 timed suspend phase_suspend
 timed resume phase_resume
 check_checkout
+if [ "$simulate_mid" = 1 ]; then check_machine_id; fi
 log "full cycle passed"

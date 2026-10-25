@@ -18,6 +18,20 @@ if [ "$GH_WRAPPER" = true ]; then
     log "warning: could not install the gh wrapper; Orca's PR actions fail with HTTP 401 once boat's GitHub token expires"
 fi
 wait_hydrated "$id" 60
+# Before Orca connects: a restarted sandbox has a new machine ID, and Orca's server on it the old one.
+# bash -s, not -l: a login profile could print to stdout. The last line is the verdict.
+machine_id="$({
+  machine_id_record_script
+  machine_id_restore_script
+  echo restore_machine_id
+} | ssh_remote 'bash -s' | tail -n 1 || true)"
+case "$machine_id" in
+  same | none) ;;
+  restored) log "put back the machine ID Orca's server on the sandbox belongs to; boat had changed it" ;;
+  failed) log "warning: boat changed the sandbox's machine ID and it could not be put back; Orca may report orcad_identity_mismatch" ;;
+  unknown) log "warning: the sandbox's machine ID matches none Orca's server could belong to; if Orca reports orcad_identity_mismatch, see Troubleshooting in the plugin README" ;;
+  *) log "warning: could not check the sandbox's machine ID" ;;
+esac
 # Puts back the git identity from create if the sandbox has lost it; one it has wins.
 if [ -n "$GIT_NAME" ]; then
   { git_identity_script; echo set_git_identity; } | ssh_remote 'bash -l -s' >&2 ||

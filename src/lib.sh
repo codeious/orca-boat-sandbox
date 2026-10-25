@@ -642,6 +642,93 @@ set_git_identity() { if [ -n "$GIT_NAME" ] && [ -n "$GIT_EMAIL" ]; then git_id n
 GITID
 }
 
+# --- machine ID ------------------------------------------------------------------------------
+# Orca 1.4.240 and later tie their server on the sandbox to the machine ID: the machineKey in
+# ~/.orca-remote/orcad-machine.json is the first 16 hex of sha256("linux:" + /etc/machine-id). boat
+# gives a restarted sandbox a new machine ID, and Orca then starts a second server that its paired
+# client cannot sign in to (orcad_identity_mismatch). So the plugin lists every machine ID it sees in
+# a file on the sandbox disk, and resume puts back the listed one Orca's server belongs to.
+
+# Prints sandbox functions: record_machine_id adds the current machine ID to that list. It never fails.
+machine_id_record_script() {
+  cat <<'MACHINEID'
+  mid_file="${ORCA_BOAT_MACHINE_ID_FILE:-/etc/machine-id}"
+  mid_list="$HOME/.local/state/orca-boat/machine-ids"
+  mid_valid() { case "$1" in *[!0-9a-f]* | '') return 1 ;; esac; [ "${#1}" = 32 ]; }
+  mid_read() { local id; id="$(cat "$mid_file" 2>/dev/null)" && mid_valid "$id" && printf '%s' "$id"; }
+  mid_add() { # id: newest last, at most 20
+    local keep
+    mkdir -p "${mid_list%/*}" || return 1
+    keep="$({ grep -vxF -- "$1" "$mid_list" 2>/dev/null || true; echo "$1"; } | tail -n 20)"
+    printf '%s\n' "$keep" >"$mid_list.tmp" && mv -f "$mid_list.tmp" "$mid_list"
+  }
+  record_machine_id() {
+    local id
+    if ! id="$(mid_read)" || ! mid_add "$id"; then echo "warning: could not record the machine ID" >&2; fi
+  }
+MACHINEID
+}
+
+# Prints a sandbox function, restore_machine_id, that needs the record script. When Orca's server was
+# set up under a listed machine ID other than the current one, it writes that ID back with sudo and
+# stops the server Orca started under the current one, which holds Orca's port. It prints one word:
+# none (no Orca server yet), same, restored, unknown (no listed ID matches) or failed. It never fails.
+machine_id_restore_script() {
+  cat <<'MACHINEID'
+  mid_sudo="${ORCA_BOAT_SUDO:-sudo -n}"
+  mid_key() {
+    printf 'linux:%s' "$1" | { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; } | cut -c1-16
+  }
+  # The path goes to awk in the environment: on its command line, awk would match itself.
+  mid_server_pids() { # dir
+    ps -u "$(id -u)" -o pid=,args= 2>/dev/null |
+      MID_DIR="$1" MID_ME="$$" awk 'index($0, ENVIRON["MID_DIR"]) && $1 != ENVIRON["MID_ME"] { print $1 }'
+  }
+  mid_stop_servers() { # key
+    local dir="$HOME/.orca-remote/hosts/$1/" pids n=0
+    pids="$(mid_server_pids "$dir")"
+    [ -n "$pids" ] || return 0
+    echo "stopping the Orca server set up under boat's new machine ID" >&2
+    # shellcheck disable=SC2086 # one word per pid
+    kill $pids 2>/dev/null || true
+    while [ -n "$(mid_server_pids "$dir")" ] && [ "$n" -lt 20 ]; do
+      sleep 0.25
+      n=$((n + 1))
+    done
+    pids="$(mid_server_pids "$dir")"
+    # shellcheck disable=SC2086
+    [ -z "$pids" ] || kill -9 $pids 2>/dev/null || true
+  }
+  restore_machine_id() {
+    local claim cur id target=""
+    cur="$(mid_read)" || { echo unknown; return 0; }
+    claim="$(sed -n 's/.*"machineKey"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{16\}\)".*/\1/p' \
+      "$HOME/.orca-remote/orcad-machine.json" 2>/dev/null | head -n 1)"
+    if [ -z "$claim" ] || [ "$(mid_key "$cur")" = "$claim" ]; then
+      mid_add "$cur" || true
+      if [ -z "$claim" ]; then echo none; else echo same; fi
+      return 0
+    fi
+    if [ -f "$mid_list" ]; then
+      while IFS= read -r id; do
+        if mid_valid "$id" && [ "$(mid_key "$id")" = "$claim" ]; then target="$id"; fi
+      done <"$mid_list"
+    fi
+    mid_add "$cur" || true
+    if [ -z "$target" ]; then echo unknown; return 0; fi
+    if [ ! -f "$mid_file" ] || [ -L "$mid_file" ]; then echo failed; return 0; fi
+    # shellcheck disable=SC2016,SC2086 # $1 and $t expand in sh; mid_sudo is a command and its flags
+    printf '%s\n' "$target" | $mid_sudo sh -c 'umask 022; t="$1.orca-boat-tmp"
+      cat >"$t" && chmod 0444 "$t" && mv -f "$t" "$1"; rc=$?; rm -f "$t"; exit "$rc"' _ "$mid_file" || true
+    if [ "$(mid_read)" != "$target" ]; then echo failed; return 0; fi
+    # Newest last, so the 20-entry list never drops the ID Orca's server belongs to.
+    mid_add "$target" || true
+    mid_stop_servers "$(mid_key "$cur")"
+    echo restored
+  }
+MACHINEID
+}
+
 # --- Orca contract ---------------------------------------------------------------------------
 
 # Orca owns the checkout in provisioned-root mode, so every result is schema 2 with that mode.

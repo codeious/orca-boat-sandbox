@@ -30,6 +30,6 @@ jobs:
       - name: Recipe is up to date and every phase is sound
         run: node build.mjs --check
       - name: Lint the other scripts
-        run: shellcheck -s bash src/gh-wrapper.sh examples/setup-mise-node.sh test/config-test.sh test/run-phase.sh test/stubs/boat
+        run: shellcheck -s bash bin/orca-boat-wake src/gh-wrapper.sh examples/setup-mise-node.sh test/config-test.sh test/run-phase.sh test/stubs/boat test/stubs/ssh
       - name: Free tests
         run: /bin/bash test/config-test.sh

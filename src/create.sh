@@ -1,6 +1,6 @@
 # Orca recipe `create` (provisioned-root): boot a boat.dev sandbox, check out the repo Orca asked for
-# (reusing the environment's clone if it has one), set the git identity, run the repo's setupScript,
-# and print the SSH connection.
+# (reusing the environment's clone if it has one), set the git identity, record the machine ID, run
+# the repo's setupScript, and print the SSH connection.
 
 remote_checkout_script() {
   cat <<'REMOTE'
@@ -74,6 +74,7 @@ main() {
     "${REPO_BRANCH:?}" "${GITHUB_READY:?}" "${ENV_CLONES_REPO:?}"
   checkout_repo
   set_git_identity
+  record_machine_id
   run_setup_script
   echo "ready at $(git rev-parse --short HEAD) on $(git rev-parse --abbrev-ref HEAD)"
 }
@@ -162,6 +163,7 @@ wait_github_access "$github_wait" "$REPO_HTTPS_URL" || github_ready=0
     "GITHUB_READY=$github_ready" "ENV_CLONES_REPO=$boat_clones" \
     "SETUP_SCRIPT=$SETUP_SCRIPT" "SETUP_SCRIPT_SRC=$SETUP_SCRIPT_SRC"
   git_identity_script
+  machine_id_record_script
   remote_checkout_script
 } | ssh_remote 'bash -l -s' >&2 || {
   rc=$?

@@ -40,7 +40,8 @@ function fail(message) {
   process.exit(1)
 }
 
-// Splits lib.sh into top-level assignments and named functions, each with its doc comment.
+// Splits lib.sh into top-level assignments and named functions. Doc comments stay in lib.sh, except
+// shellcheck directives: commands are capped at MAX_COMMAND_BYTES and the prose does not run.
 function parseLibrary(text) {
   const lines = text.split('\n')
   const fnStart = /^([a-z_][a-z0-9_]*)\(\) \{/
@@ -55,7 +56,7 @@ function parseLibrary(text) {
     const doc = []
     for (let k = pending.length - 1; k >= 0 && isComment(pending[k]); k--) doc.unshift(pending[k])
     pending = []
-    return doc
+    return doc.filter((line) => /^\s*# shellcheck /.test(line))
   }
 
   for (; i < lines.length; i++) {

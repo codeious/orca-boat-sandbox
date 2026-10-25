@@ -7,6 +7,8 @@
 #   GitHub access probe     -> exit code from $BOAT_STUB_DIR/ssh-github.rc (default 0); with the file
 #                              ssh-needs-setup-git it exits 128 unless `gh auth setup-git` runs first
 #   checkout + setup script -> exit code from $BOAT_STUB_DIR/ssh-checkout.rc (default 0)
+#   machine ID restore      -> prints $BOAT_STUB_DIR/ssh-machine-id.out (default "same"), then exits
+#                              with the code from $BOAT_STUB_DIR/ssh-machine-id.rc (default 0)
 set -u
 dir="${BOAT_STUB_DIR:?}"
 printf '%s\n' "$*" >>"$dir/ssh.log"
@@ -18,6 +20,12 @@ remote="${args[$((${#args[@]} - 1))]}"
 script="$(cat)"
 printf '%s\n-----\n' "$script" >>"$dir/ssh-scripts.log"
 case "$script" in
+  *'restore_machine_id'*)
+    if [ -f "$dir/ssh-machine-id.out" ]; then cat "$dir/ssh-machine-id.out"; else echo same; fi
+    rc=0
+    if [ -f "$dir/ssh-machine-id.rc" ]; then rc="$(cat "$dir/ssh-machine-id.rc")"; fi
+    exit "$rc"
+    ;;
   *'main </dev/null'*)
     rc=0
     if [ -f "$dir/ssh-checkout.rc" ]; then rc="$(cat "$dir/ssh-checkout.rc")"; fi
