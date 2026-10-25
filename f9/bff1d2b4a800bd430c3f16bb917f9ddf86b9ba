@@ -1,0 +1,19 @@
+recipes/boat-sandbox.json
+  s_1a974969c76e22::t_3bbd8921768c75 7-10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f9bff1d2b4a800bd430c3f16bb917f9ddf86b9ba",
+  "prompts": {},
+  "sessions": {
+    "s_1a974969c76e22": {
+      "agent_id": {
+        "tool": "droid",
+        "id": "98d6fe22-11bf-4889-8f09-f32fcfaaea7f",
+        "model": "custom:claude-opus-5-5"
+      },
+      "human_author": "noter <patryk@codeious.io>"
+    }
+  }
+}
