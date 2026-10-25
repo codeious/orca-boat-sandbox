@@ -1,0 +1,33 @@
+.github/workflows/check.yml
+  s_1a974969c76e22::t_1f23caec67ad75 33
+bin/orca-boat-wake
+  s_a57587060a50e5::t_76de1ebdb39795 1-120
+recipes/boat-sandbox.json
+  s_1a974969c76e22::t_2c119be9ed1654 7-10
+test/stubs/ssh
+  s_a57587060a50e5::t_d6de3e50746da1 10-11,23-28
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "57e4ab2fcb01b648976a7045aa7b3fd8e4587621",
+  "prompts": {},
+  "sessions": {
+    "s_1a974969c76e22": {
+      "agent_id": {
+        "tool": "droid",
+        "id": "98d6fe22-11bf-4889-8f09-f32fcfaaea7f",
+        "model": "custom:claude-opus-5-5"
+      },
+      "human_author": "noter <patryk@codeious.io>"
+    },
+    "s_a57587060a50e5": {
+      "agent_id": {
+        "tool": "droid",
+        "id": "fd4afa99-8ef7-4d49-9697-13345392d392",
+        "model": "custom:claude-sonnet-5-5"
+      },
+      "human_author": "noter <patryk@codeious.io>"
+    }
+  }
+}
