@@ -32,14 +32,20 @@ You need Orca 1.4.199 or later, the [Boat.dev CLI](https://boat.dev), and `jq` (
 
 | Orca asks for | The plugin does |
 |---|---|
-| create | Checks your login and settings first, so a typo fails before anything is billed. Then it starts a sandbox and pins its SSH host key from boat's own record. It checks out the branch and commit Orca asked for at `/home/user/<repo name>`, and runs the repo's `setupScript` if it has one. |
+| create | Checks your login and settings first, so a typo fails before anything is billed. Then it starts a sandbox and pins its SSH host key from boat's own record. It checks out the branch and commit Orca asked for at `/home/user/<repo name>`, gives git there your [name and email](#git-name-and-email), and runs the repo's `setupScript` if it has one. |
 | suspend | Stops the sandbox. Billing pauses; boat keeps the disk for 14 days. |
-| resume | Starts it again and returns its new address. |
+| resume | Starts it again and returns its new address. Puts your git name and email back if the sandbox lost them. |
 | destroy | Deletes the sandbox and its disk. |
 
 It does not install tools or dependencies. A sandbox has what its image or snapshot has. To add more, build a [tools snapshot](#building-a-tools-snapshot) or give the repo a [setup script](#setup-script).
 
 If create fails, the plugin deletes the sandbox it started. Set `ORCA_BOAT_KEEP_ON_ERROR=1` to keep it for debugging.
+
+### Git name and email
+
+Commits in the sandbox carry the same author as commits on your machine. Create reads `git config user.name` and `user.email` in the folder Orca runs it from, so the repo's own settings win over your global ones. It sets them in the sandbox's global git config, before the setup script runs, and Orca keeps them with the workspace so resume can put them back.
+
+A name or email already set in the sandbox's global or system git config wins. If your machine has none for the repo, create warns and carries on; commits in the sandbox then fail until you set them there. The log shows the name, never the email.
 
 ## Settings
 
@@ -193,7 +199,7 @@ A sandbox bills from the moment it starts until Orca suspends or deletes it. A s
 
 ## Security
 
-The commands Orca shows you run on your machine. They call `boat`, `ssh` and `ssh-keygen`, read your boat login state, and add or remove entries for sandbox hosts in `~/.ssh/known_hosts`. Each host key comes from boat's own record, so the first connection is not trust-on-first-use. Nothing is sent anywhere except to boat and to your sandbox.
+The commands Orca shows you run on your machine. They call `boat`, `ssh` and `ssh-keygen`, read your boat login state and your git name and email, and add or remove entries for sandbox hosts in `~/.ssh/known_hosts`. Each host key comes from boat's own record, so the first connection is not trust-on-first-use. Nothing is sent anywhere except to boat and to your sandbox.
 
 A repo's `.orca-boat.json` can choose the org, environment, snapshot and setup script, and the repo's code runs in the sandbox anyway. Use the plugin on repos you trust, and name only snapshots you trust. The plugin never prints a remote URL, because one can hold a token.
 
@@ -212,6 +218,7 @@ Anyone who can run code in a sandbox can read the variables, files and logins bo
 
   A public repo needs none of this.
 - **Resume warns that git cannot reach GitHub.** Resume waits 30 seconds and then carries on. The checkout is intact, and fetch and push work once boat restores the login.
+- **"Author identity unknown" when you commit in the sandbox.** A workspace created before 1.0.2 has no git name and email. Set them in the sandbox with `git config --global user.name "<name>"` and `git config --global user.email "<email>"`, or create the workspace again. From 1.0.2 on, a create log line "no usable git user.name and user.email" means your own git has none for the repo: set them on your machine, then create the workspace again.
 - **A tool is "command not found" in the sandbox.** It is probably in `~/.local/bin` only. See [Building a tools snapshot](#building-a-tools-snapshot).
 - **`orca vm recipe doctor` does not list the recipe.** It cannot see plugin recipes. Create a workspace to test.
 - **Read the log.** Every step writes to Orca's recipe log. Set `ORCA_BOAT_KEEP_ON_ERROR=1` before starting Orca to keep a sandbox that failed to create.

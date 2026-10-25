@@ -3,7 +3,7 @@
 # stdin to $BOAT_STUB_DIR/ssh-scripts.log, then answers by what the script is:
 #
 #   repo state probe        -> prints "commit"          gh wrapper install  -> exit 0
-#   resume origin probe     -> prints acme/widgets
+#   resume origin probe     -> prints acme/widgets      git identity script -> exit 0
 #   GitHub access probe     -> exit code from $BOAT_STUB_DIR/ssh-github.rc (default 0); with the file
 #                              ssh-needs-setup-git it exits 128 unless `gh auth setup-git` runs first
 #   checkout + setup script -> exit code from $BOAT_STUB_DIR/ssh-checkout.rc (default 0)

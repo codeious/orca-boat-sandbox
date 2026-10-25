@@ -1,9 +1,6 @@
-# Orca recipe `create` (checkoutMode: provisioned-root): boot a fresh boat.dev sandbox, make the
-# checkout Orca asked for, run the repo's setupScript if it has one, and print the SSH connection.
-#
-# Orca passes ORCA_REPO_URL, ORCA_REPO_REF, ORCA_REPO_REF_HEAD and ORCA_REPO_BRANCH. If the boat
-# environment already clones the repo, that clone is reused; if not, the repo is cloned here once
-# the sandbox has its GitHub login.
+# Orca recipe `create` (provisioned-root): boot a boat.dev sandbox, check out the repo Orca asked for
+# (reusing the environment's clone if it has one), set the git identity, run the repo's setupScript,
+# and print the SSH connection.
 
 remote_checkout_script() {
   cat <<'REMOTE'
@@ -43,8 +40,8 @@ checkout_repo() {
   fi
   cd "$PROJECT_ROOT"
 
-  # boat's own clone can carry a GitHub token in its origin URL, which keeps fetch and push working
-  # before the sandbox login is back. Keep that origin when it is the same repo; never print it.
+  # boat's clone can carry a token in its origin URL, which works before the sandbox login does.
+  # Keep that origin when it is the same repo; never print it.
   current="$(git config --get remote.origin.url 2>/dev/null |
     sed -E 's#^https://([^@/]*@)?github\.com/##; s#\.git$##; s#/$##' || true)"
   if [ -z "$current" ]; then
@@ -54,7 +51,7 @@ checkout_repo() {
   fi
 
   step "fetching $REPO_REF"
-  # git can echo the remote URL in its errors, and that URL may hold a token, so its output is dropped.
+  # git errors can echo the remote URL, which may hold a token, so its output is dropped.
   if ! git fetch -q origin "$REPO_REF" >/dev/null 2>&1; then
     echo "warning: git fetch failed (git cannot reach GitHub from the sandbox yet); using what is already here" >&2
   fi
@@ -76,6 +73,7 @@ main() {
   : "${PROJECT_ROOT:?}" "${REPO_SLUG:?}" "${REPO_URL:?}" "${REPO_REF:?}" "${REPO_HEAD:?}" \
     "${REPO_BRANCH:?}" "${GITHUB_READY:?}" "${ENV_CLONES_REPO:?}"
   checkout_repo
+  set_git_identity
   run_setup_script
   echo "ready at $(git rev-parse --short HEAD) on $(git rev-parse --abbrev-ref HEAD)"
 }
@@ -106,6 +104,7 @@ load_repo_request
 load_config
 preflight
 install_failure_cleanup
+load_git_identity
 
 # With no environment configured, boat clones into new sandboxes whatever its default environment lists.
 clone_env="$ENVIRONMENT"
@@ -139,9 +138,8 @@ fi
 
 wait_hydrated "$SANDBOX_ID" 120
 
-# boat's own clone does not need the sandbox's GitHub login, which can take minutes or never appear.
-# When Orca's pinned commit is already there, only give the login a short grace period so the
-# fetch can still refresh the remote refs; otherwise the login is the only way to get the commit.
+# boat's clone needs no GitHub login, which can take minutes or never come. If Orca's pinned commit
+# is already there, the login only gets a short grace period to refresh the remote refs.
 repo_state=none
 clone_deadline=$((SECONDS + 60))
 while :; do
@@ -163,6 +161,7 @@ wait_github_access "$github_wait" "$REPO_HTTPS_URL" || github_ready=0
     "REPO_REF=$REPO_REF" "REPO_HEAD=$REPO_HEAD" "REPO_BRANCH=$REPO_BRANCH" \
     "GITHUB_READY=$github_ready" "ENV_CLONES_REPO=$boat_clones" \
     "SETUP_SCRIPT=$SETUP_SCRIPT" "SETUP_SCRIPT_SRC=$SETUP_SCRIPT_SRC"
+  git_identity_script
   remote_checkout_script
 } | ssh_remote 'bash -l -s' >&2 || {
   rc=$?

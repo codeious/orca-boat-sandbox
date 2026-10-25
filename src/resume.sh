@@ -18,6 +18,11 @@ if [ "$GH_WRAPPER" = true ]; then
     log "warning: could not install the gh wrapper; Orca's PR actions fail with HTTP 401 once boat's GitHub token expires"
 fi
 wait_hydrated "$id" 60
+# Puts back the git identity from create if the sandbox has lost it; one it has wins.
+if [ -n "$GIT_NAME" ]; then
+  { git_identity_script; echo set_git_identity; } | ssh_remote 'bash -l -s' >&2 ||
+    log "warning: could not check the git identity on the sandbox"
+fi
 
 # The checkout's origin names the repo to probe. boat rewrites origin with a token in it on every
 # start, so only the owner/name leaves the sandbox, never the URL.

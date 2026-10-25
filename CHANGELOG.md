@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.2
+
+- Gives git in the sandbox your name and email, so commits work without any setup. Create reads `user.name` and `user.email` from your git config for the repo and sets them in the sandbox's global git config, unless the sandbox already has them. Resume puts them back if the sandbox lost them. Workspaces created by 1.0.1 or earlier still need them set by hand, or a new workspace.
+
 ## 1.0.1
 
 - Fixes the GitHub access check on a new sandbox. The sandbox has a `gh` login but no git credential helper until `gh auth setup-git` runs, so the check failed and create waited up to 240 seconds, then could fail on a private repo that boat had not cloned. The check and the checkout now run `gh auth setup-git` first.

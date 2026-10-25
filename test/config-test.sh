@@ -64,7 +64,7 @@ lib_eval() {
   local errf="$TMP/err"
   RC=0
   # shellcheck disable=SC2086 # EXTRA_ENV is a list of VAR=value words
-  OUT="$(env -i PATH="$BASE_PATH" HOME="$HOME_DIR" ORCA_REPO_PATH="$REPO_DIR" \
+  OUT="$(env -i PATH="$BASE_PATH" HOME="$HOME_DIR" ORCA_REPO_PATH="$REPO_DIR" GIT_CONFIG_NOSYSTEM=1 \
     BOAT_STUB_DIR="$STUB_DIR" BOAT_STUB_LOG="$LOG" $EXTRA_ENV \
     bash -c '. "$1"; eval "$2"' _ "$ROOT/src/lib.sh" "$1" <"$STDIN_FILE" 2>"$errf")" || RC=$?
   ERR="$(cat "$errf")"
@@ -76,7 +76,7 @@ run_recipe() { # phase
   command="$(jq -r --arg p "$1" '.[$p]' "$ROOT/recipes/boat-sandbox.json")"
   RC=0
   # shellcheck disable=SC2086 # EXTRA_ENV is a list of VAR=value words
-  OUT="$(env -i PATH="$BASE_PATH" HOME="$HOME_DIR" ORCA_REPO_PATH="$REPO_DIR" \
+  OUT="$(env -i PATH="$BASE_PATH" HOME="$HOME_DIR" ORCA_REPO_PATH="$REPO_DIR" GIT_CONFIG_NOSYSTEM=1 \
     BOAT_STUB_DIR="$STUB_DIR" BOAT_STUB_LOG="$LOG" $EXTRA_ENV \
     sh -c "$command" <"$STDIN_FILE" 2>"$errf")" || RC=$?
   ERR="$(cat "$errf")"
@@ -424,6 +424,130 @@ printf '%s' '{"recipeResult":{"userData":{"resourceId":"bx_ab12cd34","org":"a;b"
 lib_eval "$read_back"
 expect_fails "lifecycle org with shell characters is refused"
 
+lib_eval 'ORG=""; GH_WRAPPER=true; SSH_HOST=h; SSH_PORT=22; SSH_USER=user; IDENTITY_FILE=/k/id
+  GIT_NAME="Ada Lovelace"; GIT_EMAIL=ada@example.com; emit_ssh_result bx_ab12cd34 /home/user/widgets'
+expect_eq "result keeps the git identity in userData" "true" \
+  "$(printf '%s' "$OUT" | jq '.userData.gitName == "Ada Lovelace" and .userData.gitEmail == "ada@example.com"')"
+read_identity='read_lifecycle; printf "%s|%s\n" "$GIT_NAME" "$GIT_EMAIL"'
+printf '%s' '{"recipeResult":{"userData":{"resourceId":"bx_ab12cd34","gitName":"Ada Lovelace","gitEmail":"ada@example.com"}}}' >"$TMP/payload"
+lib_eval "$read_identity"
+expect_eq "lifecycle git identity is read back" "Ada Lovelace|ada@example.com" "$OUT"
+printf '%s' '{"recipeResult":{"userData":{"resourceId":"bx_ab12cd34","gitName":"Ada\nX","gitEmail":"ada@example.com"}}}' >"$TMP/payload"
+lib_eval "$read_identity"
+expect_ok "an unusable lifecycle git identity does not fail"
+expect_eq "...it is dropped" "|" "$OUT"
+expect_has "...with a warning" "$ERR" "ignoring an unusable git identity"
+
+# --- git identity ---------------------------------------------------------------------------------
+SANDBOX_HOME="$TMP/sandbox-home"
+SANDBOX_SYSTEM_CONFIG=/dev/null
+show_identity='load_git_identity; printf "%s|%s\n" "$GIT_NAME" "$GIT_EMAIL"'
+mac_identity() { # config-line... -> the [user] section of the global git config on "this machine"
+  {
+    echo '[user]'
+    printf '\t%s\n' "$@"
+  } >"$HOME_DIR/.gitconfig"
+}
+new_sandbox_home() {
+  rm -rf "$SANDBOX_HOME"
+  mkdir -p "$SANDBOX_HOME"
+}
+# Runs a script the way the sandbox does, with HOME at the sandbox home. Sets ERR and RC.
+on_sandbox() { # script
+  RC=0
+  env -i PATH="$BASE_PATH" HOME="$SANDBOX_HOME" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_SYSTEM="$SANDBOX_SYSTEM_CONFIG" \
+    bash -c "$1" 2>"$TMP/err" || RC=$?
+  ERR="$(cat "$TMP/err")"
+}
+sandbox_git() { # key
+  env -i PATH="$BASE_PATH" HOME="$SANDBOX_HOME" GIT_CONFIG_NOSYSTEM=1 git config --global --get "$1" || true
+}
+
+reset
+mac_identity 'name = Ada Lovelace' 'email = ada@example.com'
+lib_eval "$show_identity"
+expect_eq "git identity comes from git config on this machine" "Ada Lovelace|ada@example.com" "$OUT"
+expect_has "...the log names it and its file" "$ERR" "git identity: Ada Lovelace (user.name from file:$HOME_DIR/.gitconfig)"
+expect_lacks "...but never the email" "$ERR" "ada@example.com"
+
+env -i PATH="$BASE_PATH" HOME="$HOME_DIR" GIT_CONFIG_NOSYSTEM=1 git -C "$REPO_DIR" init -q
+printf '[user]\n\tname = Ada at Work\n\temail = ada@work.example\n' >>"$REPO_DIR/.git/config"
+lib_eval "$show_identity"
+expect_eq "the repo's own git config wins over the global one" "Ada at Work|ada@work.example" "$OUT"
+
+reset
+mac_identity 'name = Patryk Wąsik' 'email = p.wasik@example.com'
+lib_eval "$show_identity"
+expect_eq "a name with non-ASCII letters is kept" "Patryk Wąsik|p.wasik@example.com" "$OUT"
+
+reset
+lib_eval "$show_identity"
+expect_ok "no git identity on this machine does not fail"
+expect_eq "...none is sent" "|" "$OUT"
+expect_has "...with a warning" "$ERR" "warning: no usable git user.name and user.email"
+
+bad_identity() { # label config-line...
+  local label="$1"
+  shift
+  reset
+  mac_identity "$@"
+  lib_eval "$show_identity"
+  expect_eq "git identity: $label is not sent" "|" "$OUT"
+}
+bad_identity "a name without an email" 'name = Ada'
+bad_identity "a name with a newline" 'name = "Ada\nLovelace"' 'email = ada@example.com'
+bad_identity "a name with angle brackets" 'name = <Ada>' 'email = ada@example.com'
+bad_identity "an email without @" 'name = Ada' 'email = ada.example.com'
+bad_identity "an email with a space" 'name = Ada' 'email = "ada @example.com"'
+bad_identity "an email with two @" 'name = Ada' 'email = a@b@example.com'
+
+# The sandbox side: the script create and resume send, run under a fresh sandbox home.
+reset
+printf '%s' "Seán O'Brien \$HOME \`x\`" >"$TMP/git-name"
+lib_eval 'GIT_NAME="$(cat "'"$TMP"'/git-name")"; GIT_EMAIL=sean@example.com; git_identity_script'
+identity_script="$OUT"
+new_sandbox_home
+on_sandbox "set -euo pipefail
+$identity_script
+set_git_identity"
+expect_ok "the sandbox identity script runs under set -euo pipefail"
+expect_eq "...and sets user.name exactly, quotes and all" "$(cat "$TMP/git-name")" "$(sandbox_git user.name)"
+expect_eq "...and user.email" "sean@example.com" "$(sandbox_git user.email)"
+
+new_sandbox_home
+printf '[user]\n\tname = Sandbox Sam\n' >"$SANDBOX_HOME/.gitconfig"
+on_sandbox "$identity_script
+set_git_identity"
+expect_eq "a name the sandbox already has wins" "Sandbox Sam" "$(sandbox_git user.name)"
+expect_eq "...and only the missing email is set" "sean@example.com" "$(sandbox_git user.email)"
+
+new_sandbox_home
+printf '[user]\n\tname = Image Ivy\n\temail = ivy@example.com\n' >"$TMP/system-gitconfig"
+SANDBOX_SYSTEM_CONFIG="$TMP/system-gitconfig"
+on_sandbox "$identity_script
+set_git_identity"
+SANDBOX_SYSTEM_CONFIG=/dev/null
+expect_eq "an identity in the sandbox's system git config wins too" "|" "$(sandbox_git user.name)|$(sandbox_git user.email)"
+
+reset
+lib_eval 'git_identity_script'
+new_sandbox_home
+on_sandbox "$OUT
+set_git_identity"
+expect_ok "without an identity the sandbox script does nothing"
+expect_eq "...and writes no git config" "no" "$(if [ -e "$SANDBOX_HOME/.gitconfig" ]; then echo yes; else echo no; fi)"
+
+if [ "$(id -u)" != 0 ]; then
+  new_sandbox_home
+  chmod 555 "$SANDBOX_HOME"
+  on_sandbox "set -euo pipefail
+$identity_script
+set_git_identity"
+  chmod 755 "$SANDBOX_HOME"
+  expect_ok "a git config the sandbox cannot write does not fail the script"
+  expect_has "...it warns instead" "$ERR" "warning: could not set git user.name"
+fi
+
 # --- host keys ----------------------------------------------------------------------------------
 reset
 lib_eval 'KNOWN_HOSTS="$HOME/.ssh/known_hosts"
@@ -560,6 +684,22 @@ expect_has "create says where each setting came from" "$ERR" "environment = team
 
 reset
 fake_sandbox
+mac_identity 'name = Ada Lovelace' 'email = ada@example.com'
+EXTRA_ENV="$create_env ORCA_REPO_URL=git@github.com:acme/widgets.git"
+run_recipe create
+expect_ok "create with a git identity on this machine"
+expect_has "...sends the name to the sandbox on stdin" "$(scripts_sent)" 'export GIT_NAME=Ada\ Lovelace'
+expect_has "...and the email" "$(scripts_sent)" "export GIT_EMAIL=ada@example.com"
+expect_lacks "...never on the ssh command line" "$(cat "$STUB_DIR/ssh.log")" "ada@example.com"
+expect_lacks "...nor in the log" "$ERR" "ada@example.com"
+expect_eq "...records it for resume" "true" \
+  "$(printf '%s' "$OUT" | jq '.userData.gitName == "Ada Lovelace" and .userData.gitEmail == "ada@example.com"')"
+expect_eq "...and sets it after the checkout and before the setup script" "yes" "$(scripts_sent | sed -n '/^main() {/,/^}/p' |
+  awk '/checkout_repo/ && !c { c = NR } /set_git_identity/ && !g { g = NR } /run_setup_script/ && !s { s = NR }
+    END { print (c && g && s && c < g && g < s) ? "yes" : "no" }')"
+
+reset
+fake_sandbox
 repo_cfg '{"ghWrapper":false}'
 EXTRA_ENV="$create_env ORCA_REPO_URL=git@github.com:acme/widgets.git"
 run_recipe create
@@ -569,6 +709,8 @@ expect_lacks "create without an org passes no --org" "$(cat "$LOG")" "--org"
 expect_lacks "create skips the gh wrapper when asked" "$(scripts_sent)" "gh.real"
 expect_eq "create records ghWrapper=false for later phases" "false" "$(printf '%s' "$OUT" | jq '.userData.ghWrapper')"
 expect_eq "create leaves org out of userData" "false" "$(printf '%s' "$OUT" | jq '.userData | has("org")')"
+expect_has "create warns when this machine has no git identity" "$ERR" "no usable git user.name and user.email"
+expect_eq "...and records none" "false" "$(printf '%s' "$OUT" | jq '.userData | has("gitName")')"
 
 reset
 fake_sandbox
@@ -630,6 +772,19 @@ expect_has "resume wakes the sandbox in its org" "$(cat "$LOG")" "--org Acme res
 expect_has "resume pins the host key" "$(cat "$HOME_DIR/.ssh/known_hosts")" "203.0.113.9 ssh-ed25519 AAAAboatkey"
 expect_has "resume reinstalls the gh wrapper by default" "$(scripts_sent)" "gh.real"
 expect_lacks "resume keeps boat's resume JSON out of the log" "$ERR" '"event":"resumed"'
+expect_lacks "resume of a sandbox created without a git identity leaves git alone" "$(scripts_sent)" "set_git_identity"
+
+reset
+fake_sandbox
+printf '%s' "$life" | jq -c --arg k "$DEFAULT_KEY" '.recipeResult.connection.target.identityFile = $k
+  | .recipeResult.userData += {gitName: "Ada Lovelace", gitEmail: "ada@example.com"}' >"$TMP/payload"
+STDIN_FILE="$TMP/payload"
+run_recipe resume
+expect_ok "resume with a recorded git identity"
+expect_has "...puts it back where the sandbox lost it" "$(scripts_sent)" "set_git_identity"
+expect_has "...from what create recorded" "$(scripts_sent)" 'export GIT_NAME=Ada\ Lovelace'
+expect_eq "...and keeps it for the next resume" "true" \
+  "$(printf '%s' "$OUT" | jq '.userData.gitName == "Ada Lovelace" and .userData.gitEmail == "ada@example.com"')"
 
 reset
 fake_sandbox

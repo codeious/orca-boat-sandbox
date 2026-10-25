@@ -58,6 +58,8 @@ IDENTITY_FILE_SRC=""
 SANDBOX_ID=""
 SSH_HOST=""
 SSH_PORT=""
+GIT_NAME=""
+GIT_EMAIL=""
 
 log() { printf '[boat] %s\n' "$*" >&2; }
 die() {
@@ -210,10 +212,9 @@ load_config() {
 
 # --- the repo Orca asks for (provisioned-root) -----------------------------------------------
 
-# Reads the checkout Orca wants from ORCA_REPO_* and sets REPO_HTTPS_URL, REPO_SLUG, REPO_NAME,
-# PROJECT_ROOT, REPO_REF, REPO_HEAD and REPO_BRANCH. The sandbox only has a GitHub login, so the
-# remote is rewritten to https; any other host is refused. Error messages never echo the URL,
-# because a remote can carry a token.
+# Sets the REPO_* variables and PROJECT_ROOT from the checkout Orca wants (ORCA_REPO_*). The sandbox
+# only has a GitHub login, so the remote becomes https and other hosts are refused. Errors never echo
+# the URL, because a remote can carry a token.
 load_repo_request() {
   local url path owner
   [ "${ORCA_RECIPE_RESULT_SCHEMA_VERSION:-}" = 2 ] ||
@@ -606,14 +607,50 @@ emit_exports() { # KEY=value...
   done
 }
 
+# --- git identity ----------------------------------------------------------------------------
+
+# True when both are safe to hand to git config: no control characters or angle brackets, and an
+# email of the form a@b without spaces.
+valid_git_identity() { # name email
+  [ -n "$1" ] && [ "$(printf '%s%s' "$1" "$2" | LC_ALL=C tr -d '\000-\037\177<>')" = "$1$2" ] || return 1
+  case "$2" in *[[:space:]]* | @* | *@ | *@*@*) return 1 ;; *@*) return 0 ;; *) return 1 ;; esac
+}
+
+# Sets GIT_NAME and GIT_EMAIL to the identity git uses for this repo on this machine, so commits
+# made on the sandbox carry the same author.
+load_git_identity() {
+  local dir="${ORCA_REPO_PATH:-$PWD}" out name email
+  out="$(git -C "$dir" config --show-origin --get user.name 2>/dev/null || true)"
+  name="${out#*$'\t'}"
+  email="$(git -C "$dir" config --get user.email 2>/dev/null || true)"
+  if valid_git_identity "$name" "$email"; then
+    GIT_NAME="$name"
+    GIT_EMAIL="$email"
+    log "git identity: $name (user.name from ${out%%$'\t'*})"
+  else
+    log "warning: no usable git user.name and user.email for $dir here; to commit on the sandbox, set them there"
+  fi
+}
+
+# Prints a sandbox function, set_git_identity, that sets git's user.name and user.email from GIT_NAME
+# and GIT_EMAIL where neither the global nor the system git config has one. It never fails.
+git_identity_script() {
+  emit_exports "GIT_NAME=$GIT_NAME" "GIT_EMAIL=$GIT_EMAIL"
+  cat <<'GITID'
+git_id() { git config --global --get "user.$1" >/dev/null || git config --system --get "user.$1" >/dev/null || git config --global "user.$1" "$2" || echo "warning: could not set git user.$1" >&2; }
+set_git_identity() { if [ -n "$GIT_NAME" ] && [ -n "$GIT_EMAIL" ]; then git_id name "$GIT_NAME"; git_id email "$GIT_EMAIL"; fi; }
+GITID
+}
+
 # --- Orca contract ---------------------------------------------------------------------------
 
 # Orca owns the checkout in provisioned-root mode, so every result is schema 2 with that mode.
 # userData is all a later suspend, resume or destroy knows about this sandbox: the project path,
-# and the org and gh wrapper choice it was created with.
+# and the org, gh wrapper choice and git identity it was created with.
 emit_ssh_result() { # id project_root
   jq -cn --arg id "$1" --arg root "$2" --arg host "$SSH_HOST" --argjson port "$SSH_PORT" \
-    --arg user "$SSH_USER" --arg identity "$IDENTITY_FILE" --arg org "$ORG" --argjson gh "$GH_WRAPPER" '{
+    --arg user "$SSH_USER" --arg identity "$IDENTITY_FILE" --arg org "$ORG" --argjson gh "$GH_WRAPPER" \
+    --arg gn "$GIT_NAME" --arg ge "$GIT_EMAIL" '{
       schemaVersion: 2,
       checkoutMode: "provisioned-root",
       connection: {
@@ -629,14 +666,15 @@ emit_ssh_result() { # id project_root
         }
       },
       userData: ({provider: "boat", resourceId: $id, projectRoot: $root, ghWrapper: $gh}
-        + (if $org == "" then {} else {org: $org} end))
+        + (if $org == "" then {} else {org: $org} end)
+        + (if $gn == "" then {} else {gitName: $gn, gitEmail: $ge} end))
     }'
 }
 
 # Reads the lifecycle JSON Orca writes to stdin and sets LIFECYCLE_ID, LIFECYCLE_ROOT, ORG,
-# SSH_USER, IDENTITY_FILE and GH_WRAPPER to what the sandbox was created with.
+# SSH_USER, IDENTITY_FILE, GH_WRAPPER, GIT_NAME and GIT_EMAIL to what the sandbox was created with.
 read_lifecycle() {
-  local payload id root org user identity
+  local payload id root org user identity name email
   payload="$(cat)"
   id="$(printf '%s' "$payload" | jq -r '.recipeResult.userData.resourceId // empty')"
   [ -n "$id" ] || die "no resource id in the lifecycle payload"
@@ -661,4 +699,12 @@ read_lifecycle() {
   if [ -n "$identity" ]; then IDENTITY_FILE="$identity"; fi
   GH_WRAPPER="$(printf '%s' "$payload" |
     jq -r 'if .recipeResult.userData.ghWrapper == false then "false" else "true" end')"
+  name="$(printf '%s' "$payload" | jq -r '.recipeResult.userData.gitName // empty')"
+  email="$(printf '%s' "$payload" | jq -r '.recipeResult.userData.gitEmail // empty')"
+  if valid_git_identity "$name" "$email"; then
+    GIT_NAME="$name"
+    GIT_EMAIL="$email"
+  elif [ -n "$name$email" ]; then
+    log "warning: ignoring an unusable git identity in the lifecycle payload"
+  fi
 }
