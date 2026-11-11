@@ -1,0 +1,64 @@
+orca-plugin.json
+  s_68e3ab85ee10ba::t_cf14fe8ed1a08c 6
+README.md
+  s_68e3ab85ee10ba::t_aaed6c00a2ca77 105
+  s_68e3ab85ee10ba::t_30d4904f0340f0 69
+  s_68e3ab85ee10ba::t_bc0accdf3d3653 37
+  s_68e3ab85ee10ba::t_15ce6516112cd4 56-68,71-84
+  s_68e3ab85ee10ba::t_f8b9992231269f 70
+  s_68e3ab85ee10ba::t_b3253739b09660 256
+  s_68e3ab85ee10ba::t_bab882fe821ada 97
+src/lib.sh
+  s_68e3ab85ee10ba::t_99d2281e3f6782 213
+  s_68e3ab85ee10ba::t_c4f7be01de0c88 192-195
+  s_68e3ab85ee10ba::t_83485ad5f317d6 773
+  s_68e3ab85ee10ba::t_c139e68d3c4e50 18
+  s_68e3ab85ee10ba::t_091f123c28de67 47
+  s_68e3ab85ee10ba::t_38b6f6b957435a 752
+  s_68e3ab85ee10ba::t_c0313759706a4a 364,371-376
+  s_68e3ab85ee10ba::t_3810f31c1ebe4d 756
+  s_68e3ab85ee10ba::t_016bec0c9864a0 779
+  s_68e3ab85ee10ba::t_6214bcace7b118 806-807
+  s_68e3ab85ee10ba::t_6375e609e729bb 353-355,358
+  s_68e3ab85ee10ba::t_3c364e536595b7 56
+  s_68e3ab85ee10ba::t_6379cf73ab7d7d 377-378
+src/resume.sh
+  s_68e3ab85ee10ba::t_451b4011985a20 9-18,20-38
+CHANGELOG.md
+  s_68e3ab85ee10ba::t_79ae30b54a74cb 3-7
+bin/orca-boat-recover
+  s_68e3ab85ee10ba::t_3ec91a2f201529 1-160
+.github/workflows/check.yml
+  s_68e3ab85ee10ba::t_d6c41b045ea91c 33
+test/stubs/boat
+  s_68e3ab85ee10ba::t_774896f39ad930 26-32
+  s_68e3ab85ee10ba::t_591735e838b440 7,9
+  s_68e3ab85ee10ba::t_2f4dc56da9c058 45
+test/config-test.sh
+  s_68e3ab85ee10ba::t_5c9259c6282f52 5-6
+  s_68e3ab85ee10ba::t_c358023273ea56 456-468,471
+  s_68e3ab85ee10ba::t_ff2e13e1dd7a1c 174-200
+  s_68e3ab85ee10ba::t_0347c18cc26645 1012-1033,1035-1092
+  s_68e3ab85ee10ba::t_5565874c83b657 1034
+  s_68e3ab85ee10ba::t_f0958d9c6480ee 1182-1289
+schema/orca-boat.schema.json
+  s_68e3ab85ee10ba::t_45b1cbf1a3991b 39-43
+recipes/boat-sandbox.json
+  s_68e3ab85ee10ba::t_071528e5ec1c9c 7-10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fb283c7bc3f9ff2ffe29d2aa97f8b64dca0b63fd",
+  "prompts": {},
+  "sessions": {
+    "s_68e3ab85ee10ba": {
+      "agent_id": {
+        "tool": "droid",
+        "id": "74fbb350-48a1-42a5-b733-bc89e9b24ea2",
+        "model": "custom:claude-sonnet-5-5"
+      },
+      "human_author": "noter <patryk@codeious.io>"
+    }
+  }
+}
