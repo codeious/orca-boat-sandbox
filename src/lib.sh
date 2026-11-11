@@ -15,7 +15,7 @@ export BOAT_NO_UPDATE=true
 KNOWN_HOSTS="${ORCA_BOAT_KNOWN_HOSTS:-$HOME/.ssh/known_hosts}"
 USER_CONFIG="${ORCA_BOAT_CONFIG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/orca-boat/config.json}"
 REPO_CONFIG_NAME=".orca-boat.json"
-SETTING_KEYS="org environment snapshot machineType setupScript ghWrapper sshUser identityFile"
+SETTING_KEYS="org environment snapshot machineType setupScript ghWrapper recovery sshUser identityFile"
 LOCAL_ONLY_KEYS="sshUser identityFile"
 # jq: the user file's entry for this repo, matched without regard to case.
 # shellcheck disable=SC2016 # $r is a jq variable
@@ -44,6 +44,7 @@ SNAPSHOT=""
 MACHINE_TYPE=default
 SETUP_SCRIPT=""
 GH_WRAPPER=true
+RECOVERY=off
 SSH_USER=user
 IDENTITY_FILE="$HOME/.ssh/ascii_box_ed25519"
 ORG_SRC=""
@@ -52,6 +53,7 @@ SNAPSHOT_SRC=""
 MACHINE_TYPE_SRC=""
 SETUP_SCRIPT_SRC=""
 GH_WRAPPER_SRC=""
+RECOVERY_SRC=""
 SSH_USER_SRC=""
 IDENTITY_FILE_SRC=""
 
@@ -187,6 +189,10 @@ validate_settings() {
     true | false) ;;
     *) die "invalid ghWrapper '$GH_WRAPPER' (from $GH_WRAPPER_SRC): use true or false" ;;
   esac
+  case "$RECOVERY" in
+    off | snapshot) ;;
+    *) die "invalid recovery '$RECOVERY' (from $RECOVERY_SRC): use off or snapshot" ;;
+  esac
   case "$IDENTITY_FILE" in
     '' | -* | *$'\n'*) die "invalid identityFile '$IDENTITY_FILE' (from $IDENTITY_FILE_SRC)" ;;
   esac
@@ -204,6 +210,7 @@ load_config() {
   load_setting MACHINE_TYPE machineType ORCA_BOAT_MACHINE_TYPE default
   load_setting SETUP_SCRIPT setupScript ORCA_BOAT_SETUP_SCRIPT ""
   load_setting GH_WRAPPER ghWrapper ORCA_BOAT_GH_WRAPPER true
+  load_setting RECOVERY recovery ORCA_BOAT_RECOVERY off
   load_setting SSH_USER sshUser ORCA_BOAT_SSH_USER user
   load_setting IDENTITY_FILE identityFile ORCA_BOAT_IDENTITY_FILE "$HOME/.ssh/ascii_box_ed25519"
   IDENTITY_FILE="${IDENTITY_FILE/#\~/$HOME}"
@@ -343,21 +350,30 @@ preflight() {
 
 # --- sandbox lifecycle -----------------------------------------------------------------------
 
-# Creates a sandbox and sets SANDBOX_ID as soon as it is known, so a failure can still clean up.
-new_sandbox() { # boat new flags...
+# Runs a boat command that makes a sandbox (new, fork) and waits for it. Sets SANDBOX_ID as soon as
+# the event stream names it, so a failure can still clean up.
+boat_launch() { # subcommand args...
   local events rc=0 err
   events="$(mktemp "${TMPDIR:-/tmp}/boat-new.XXXXXX")"
-  boat_cli new --json "$@" >"$events" || rc=$?
+  boat_cli "$1" --json "${@:2}" >"$events" || rc=$?
   SANDBOX_ID="$(jq -rs '[.[] | objects | (.id // .sandbox.id // empty)
     | select(type == "string" and startswith("bx_"))] | first // empty' "$events" 2>/dev/null || true)"
   if [ "$rc" -ne 0 ] || ! jq -es 'any(.[]; type == "object" and .event == "ready")' "$events" >/dev/null 2>&1; then
     err="$(jq -rs '[.[] | objects | select(.event == "error") | (.error // .message)] | last // empty' \
       "$events" 2>/dev/null || true)"
-    log "boat new failed (exit $rc): ${err:-no error event}"
+    log "boat $1 failed (exit $rc): ${err:-no error event}"
     rm -f "$events"
     return 1
   fi
   rm -f "$events"
+}
+
+new_sandbox() { boat_launch new "$@"; }
+
+# Forks the sandbox's latest snapshot into a new sandbox. It inherits the source's org, environment
+# and machine size, and the source is left as it is.
+fork_sandbox() { # id
+  boat_launch fork --no-auto-stop --wait "$1"
 }
 
 delete_sandbox() { # id
@@ -733,11 +749,11 @@ MACHINEID
 
 # Orca owns the checkout in provisioned-root mode, so every result is schema 2 with that mode.
 # userData is all a later suspend, resume or destroy knows about this sandbox: the project path,
-# and the org, gh wrapper choice and git identity it was created with.
+# and the org, gh wrapper choice, recovery mode and git identity it was created with.
 emit_ssh_result() { # id project_root
   jq -cn --arg id "$1" --arg root "$2" --arg host "$SSH_HOST" --argjson port "$SSH_PORT" \
     --arg user "$SSH_USER" --arg identity "$IDENTITY_FILE" --arg org "$ORG" --argjson gh "$GH_WRAPPER" \
-    --arg gn "$GIT_NAME" --arg ge "$GIT_EMAIL" '{
+    --arg gn "$GIT_NAME" --arg ge "$GIT_EMAIL" --arg rec "$RECOVERY" '{
       schemaVersion: 2,
       checkoutMode: "provisioned-root",
       connection: {
@@ -754,12 +770,13 @@ emit_ssh_result() { # id project_root
       },
       userData: ({provider: "boat", resourceId: $id, projectRoot: $root, ghWrapper: $gh}
         + (if $org == "" then {} else {org: $org} end)
+        + (if $rec == "snapshot" then {recovery: $rec} else {} end)
         + (if $gn == "" then {} else {gitName: $gn, gitEmail: $ge} end))
     }'
 }
 
 # Reads the lifecycle JSON Orca writes to stdin and sets LIFECYCLE_ID, LIFECYCLE_ROOT, ORG,
-# SSH_USER, IDENTITY_FILE, GH_WRAPPER, GIT_NAME and GIT_EMAIL to what the sandbox was created with.
+# SSH_USER, IDENTITY_FILE, GH_WRAPPER, RECOVERY, GIT_NAME and GIT_EMAIL to what the sandbox was created with.
 read_lifecycle() {
   local payload id root org user identity name email
   payload="$(cat)"
@@ -786,6 +803,8 @@ read_lifecycle() {
   if [ -n "$identity" ]; then IDENTITY_FILE="$identity"; fi
   GH_WRAPPER="$(printf '%s' "$payload" |
     jq -r 'if .recipeResult.userData.ghWrapper == false then "false" else "true" end')"
+  RECOVERY="$(printf '%s' "$payload" |
+    jq -r 'if .recipeResult.userData.recovery == "snapshot" then "snapshot" else "off" end')"
   name="$(printf '%s' "$payload" | jq -r '.recipeResult.userData.gitName // empty')"
   email="$(printf '%s' "$payload" | jq -r '.recipeResult.userData.gitEmail // empty')"
   if valid_git_identity "$name" "$email"; then

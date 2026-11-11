@@ -6,9 +6,36 @@ read_lifecycle
 id="$LIFECYCLE_ID"
 [ -n "$LIFECYCLE_ROOT" ] || die "the lifecycle payload has no project root; this sandbox was not made by this recipe"
 
+try_resume() { # id wait_seconds
+  if boat_quiet resume "$1" --no-auto-stop --json && wait_for_state "$1" "$2" 'ready|idle|running'; then
+    return 0
+  fi
+  return 1
+}
+
+# Without recovery a sandbox boat cannot resume ends the wake. With it, the disk-preserving step
+# comes first, so a hang that a power cycle clears costs no data; only then is the latest snapshot
+# forked. The old sandbox is never deleted, and no trap here deletes the fork.
 log "resuming $id"
-boat_quiet resume "$id" --no-auto-stop --json || exit 1
-wait_for_state "$id" 300 'ready|idle|running' || exit 1
+if ! try_resume "$id" 300; then
+  [ "$RECOVERY" = snapshot ] ||
+    die "boat cannot resume $id. To recover it from its latest snapshot, set recovery to snapshot (see Recovering an unrecoverable sandbox in the plugin README), or run orca-boat-recover"
+  log "recovery: $id would not resume; power-cycling it with boat recover"
+  if boat_quiet recover "$id" --json && try_resume "$id" 180; then
+    log "recovery: $id is back after a power cycle; its disk was not touched"
+  else
+    log "recovery: forking the latest snapshot of $id. Changes on its disk made after that snapshot are not on the fork"
+    fork_sandbox "$id" || die "recovery failed: could not fork $id from its latest snapshot"
+    [ -n "$SANDBOX_ID" ] && [ "$SANDBOX_ID" != "$id" ] || die "recovery failed: boat did not report a new sandbox for the fork of $id"
+    stuck_id="$id"
+    id="$SANDBOX_ID"
+    trap 'rc=$?; [ "$rc" -eq 0 ] || log "warning: the fork $id is running but Orca does not know it yet; use it, or delete it with boat delete $id"; exit "$rc"' EXIT
+    stuck_delete="boat delete $stuck_id"
+    if [ -n "$ORG" ]; then stuck_delete="boat --org $ORG delete $stuck_id"; fi
+    log "recovery: forked $stuck_id into $id, which Orca now uses. $stuck_id is kept; once you are sure nothing in it is needed, delete it with: $stuck_delete"
+    wait_for_state "$id" 300 'ready|idle|running' || exit 1
+  fi
+fi
 
 resolve_endpoint "$id" || exit 1
 pin_host_key "$id" "$SSH_HOST" "$SSH_PORT" || exit 1

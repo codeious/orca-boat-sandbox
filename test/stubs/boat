@@ -4,7 +4,9 @@
 #
 #   boat status        -> status.json            boat env list        -> env-list.json
 #   boat org list      -> org-list.json          boat env info NAME   -> env-info-NAME.json
+#   boat snapshot latest ID -> snapshot-latest.json
 #   boat <cmd> ...     -> <cmd>.json             <fixture>.rc holds a non-zero exit code
+#   <fixture>.N (and <fixture>.N.rc) answers the Nth call of that command instead
 set -u
 printf '%s\n' "$*" >>"${BOAT_STUB_LOG:?}"
 
@@ -21,7 +23,13 @@ while [ $# -gt 0 ]; do
 done
 
 reply() {
-  local fixture="$BOAT_STUB_DIR/$1" rc=0
+  local fixture="$BOAT_STUB_DIR/$1" rc=0 calls=0
+  # <fixture>.<N> answers the Nth call of that command (and its .rc the exit code), so a test can
+  # script a command that fails first and works later.
+  if [ -f "$fixture.count" ]; then calls="$(cat "$fixture.count")"; fi
+  calls=$((calls + 1))
+  printf '%s' "$calls" >"$fixture.count"
+  if [ -f "$fixture.$calls" ]; then fixture="$fixture.$calls"; fi
   if [ -f "$fixture" ]; then
     cat "$fixture"
     if [ -f "$fixture.rc" ]; then rc="$(cat "$fixture.rc")"; fi
@@ -34,5 +42,6 @@ reply() {
 case "${words[0]:-}" in
   env) reply "env-${words[1]:-}${words[2]:+-${words[2]}}.json" ;;
   org) reply "org-${words[1]:-}.json" ;;
+  snapshot) reply "snapshot-${words[1]:-}.json" ;;
   *) reply "${words[0]:-none}.json" ;;
 esac

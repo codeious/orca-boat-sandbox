@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.4
+
+- Adds the `recovery` setting for a sandbox that is stuck `stopping` and that `boat resume` refuses. Off by default. With `recovery: snapshot`, resume first power-cycles the sandbox with `boat recover`, which leaves its disk alone. If that does not help, it forks the sandbox's latest snapshot with `boat fork` into a new sandbox with the same org, environment and size, and returns the fork so Orca moves the workspace to it. Disk changes made after that snapshot are not on the fork. The stuck sandbox is kept, and resume logs the command to delete it. The setting is stored with the workspace at create time, so workspaces created by 1.0.3 or earlier have recovery off.
+- Adds `bin/orca-boat-recover`, for a stuck sandbox when Orca still shows the workspace as running, so resume never runs, or when `recovery` was off. It forks the latest snapshot, stops the fork, and points the workspace at it in Orca's runtime file (backed up first). Click the workspace afterwards and resume does the rest. See Recovering an unrecoverable sandbox in the README.
+
 ## 1.0.3
 
 - Keeps Orca connected when boat gives a restarted sandbox a new machine ID. Orca 1.4.240 and later tie their server on the sandbox to `/etc/machine-id`; after a change, Orca started a second server it could not sign in to and reported `orcad_identity_mismatch`. Create and resume now list the machine IDs they see on the sandbox, and resume puts back the one Orca's server belongs to before Orca connects. It also stops the second server if Orca already started one. Resume only warns if it cannot. Workspaces created by 1.0.2 or earlier do not get this.

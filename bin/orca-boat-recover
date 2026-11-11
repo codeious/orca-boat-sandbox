@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# Moves a boat workspace in Orca onto a fork of its sandbox's latest snapshot. Use it when boat wedged
+# the sandbox (stuck stopping, or `boat resume` refuses it) while Orca still shows the workspace as
+# running, so the plugin's resume never runs, or when the workspace was created with `recovery` off.
+# Workspaces whose recovery is `snapshot` do this by themselves when Orca wakes them.
+#
+#   orca-boat-recover                                list Orca's boat workspaces
+#   orca-boat-recover [options] <bx_id | name>       fork one and point the workspace at the fork
+#
+#   --store FILE   Orca's orca-ephemeral-vm-runtimes.json (default: the one in Orca's folder)
+#   --dry-run      show what would change and change nothing
+#   --force        also fork a sandbox boat reports as healthy
+#
+# Disk changes made after the sandbox's latest snapshot are not on the fork. The old sandbox is kept;
+# delete it with boat delete once you are sure nothing in it is needed.
+# Needs jq and boat. Backs the file up first and changes only that workspace's sandbox and status.
+set -euo pipefail
+
+export PATH="$HOME/.ascii/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+export BOAT_NO_UPDATE=true
+
+usage() {
+  sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//' >&2
+  exit 2
+}
+die() {
+  printf 'orca-boat-recover: %s\n' "$*" >&2
+  exit 1
+}
+
+default_store() {
+  case "$(uname -s)" in
+    Darwin) printf '%s' "$HOME/Library/Application Support/Orca/orca-ephemeral-vm-runtimes.json" ;;
+    *) printf '%s' "${XDG_CONFIG_HOME:-$HOME/.config}/Orca/orca-ephemeral-vm-runtimes.json" ;;
+  esac
+}
+
+store="" dry_run=0 force=0 want=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --store)
+      store="${2:?--store needs a file}"
+      shift
+      ;;
+    --dry-run) dry_run=1 ;;
+    --force) force=1 ;;
+    -h | --help) usage ;;
+    -*) usage ;;
+    *)
+      [ -z "$want" ] || usage
+      want="$1"
+      ;;
+  esac
+  shift
+done
+command -v jq >/dev/null 2>&1 || die "jq is not on PATH"
+[ -n "$store" ] || store="$(default_store)"
+[ -f "$store" ] || die "no Orca runtime file at $store; pass the right one with --store FILE"
+jq -e '.runtimes | type == "array"' "$store" >/dev/null 2>&1 || die "$store is not an Orca runtime file"
+
+# Records of deleted sandboxes stay as "cleaned"; they are never the one meant.
+BOAT='.runtimes[] | select(.recipeResult.userData.provider == "boat" and .status != "cleaned")'
+ADDRESS='(.recipeResult.connection.target // {}) | "\(.host // "-"):\(.port // "-")"'
+
+if [ -z "$want" ]; then
+  {
+    printf 'WORKSPACE\tSANDBOX\tSTATUS\tADDRESS IN ORCA\n'
+    jq -r "$BOAT | [.workspaceName // \"-\", .recipeResult.userData.resourceId // \"-\", .status, ($ADDRESS)] | @tsv" "$store"
+  } | awk -F '\t' '{ printf "%-28s %-12s %-14s %s\n", $1, $2, $3, $4 }'
+  exit 0
+fi
+
+matches="$(jq -c --arg w "$want" "[$BOAT | select(.recipeResult.userData.resourceId == \$w or .workspaceName == \$w)]" "$store")"
+count="$(printf '%s' "$matches" | jq 'length')"
+[ "$count" -gt 0 ] || die "no boat workspace '$want' in $store; run without arguments to list them"
+[ "$count" -eq 1 ] || die "$count boat workspaces match '$want'; use the sandbox id (bx_...) instead"
+record="$(printf '%s' "$matches" | jq -c '.[0]')"
+field() { printf '%s' "$record" | jq -r "$1"; }
+runtime_id="$(field .id)"
+name="$(field '.workspaceName // "-"')"
+sandbox="$(field '.recipeResult.userData.resourceId // empty')"
+org="$(field '.recipeResult.userData.org // empty')"
+status="$(field .status)"
+
+[[ "$sandbox" =~ ^bx_[a-z0-9]{8}$ ]] || die "'$name' has no usable sandbox id in Orca's file (got '$sandbox')"
+[[ -z "$org" || "$org" =~ ^[A-Za-z0-9][A-Za-z0-9._\ -]*$ ]] || die "'$name' has an unusable organization '$org' in Orca's file"
+case "$status" in
+  running | suspended | resume_failed) ;;
+  *) die "'$name' ($sandbox) is $status in Orca; this only changes a workspace Orca shows as running, asleep or failed to wake" ;;
+esac
+command -v boat >/dev/null 2>&1 || die "boat is not on PATH"
+
+boat_cli() {
+  if [ -n "$org" ]; then boat --org "$org" "$@"; else boat "$@"; fi
+}
+
+info="$(boat_cli info "$sandbox" --json 2>/dev/null || true)"
+state="$(printf '%s' "$info" | jq -r '.sandbox.state // empty' 2>/dev/null || true)"
+health="$(printf '%s' "$info" | jq -r '.sandbox.health // "ok"' 2>/dev/null || echo ok)"
+echo "boat: $sandbox is ${state:-in an unknown state} (health: $health); Orca shows '$name' as $status"
+
+# A sandbox that is stopped, or running and healthy, is not what this is for.
+case "$state:$health" in
+  ready:ok | idle:ok | running:ok | stopped:ok)
+    if [ "$force" != 1 ]; then
+      die "$sandbox looks healthy. If Orca cannot reach it, run orca-boat-wake instead; to fork it anyway, use --force"
+    fi
+    ;;
+esac
+
+snap="$(boat_cli snapshot latest "$sandbox" --json 2>/dev/null || true)"
+if ! printf '%s' "$snap" | jq -e '.snapshot | objects' >/dev/null 2>&1; then
+  die "boat has no snapshot of $sandbox to fork from"
+fi
+snap_time="$(printf '%s' "$snap" | jq -r '.snapshot | (.completedAt // .createdAt // .takenAt // .capturedAt // .updatedAt // "at a time boat did not report")')"
+echo "latest snapshot of $sandbox: $snap_time. Disk changes made after it are not on the fork."
+
+if [ "$dry_run" = 1 ]; then
+  echo "dry run: would fork $sandbox, stop the fork, and point '$name' at it in $store (status $status -> resume_failed)"
+  exit 0
+fi
+
+events="$(mktemp "${TMPDIR:-/tmp}/boat-recover.XXXXXX")"
+trap 'rm -f "$events"' EXIT
+echo "forking $sandbox (this can take a few minutes)..."
+rc=0
+boat_cli fork --json --no-auto-stop --wait "$sandbox" >"$events" || rc=$?
+new="$(jq -rs --arg old "$sandbox" '[.[] | objects | (.id // .sandbox.id // empty)
+  | select(type == "string" and startswith("bx_") and . != $old)] | first // empty' "$events" 2>/dev/null || true)"
+if [ "$rc" -ne 0 ] || ! jq -es 'any(.[]; type == "object" and .event == "ready")' "$events" >/dev/null 2>&1; then
+  err="$(jq -rs '[.[] | objects | select(.event == "error") | (.error // .message)] | last // empty' "$events" 2>/dev/null || true)"
+  [ -z "$new" ] || echo "a partial fork $new may exist; check boat list" >&2
+  die "boat fork failed (exit $rc): ${err:-no error event}"
+fi
+[[ "$new" =~ ^bx_[a-z0-9]{8}$ ]] || die "boat did not report the new sandbox's id"
+echo "forked $sandbox into $new"
+
+# Orca's resume expects a stopped sandbox with a snapshot. If this fails, the fork is still the one to use.
+if ! boat_cli stop "$new" --json >/dev/null 2>&1; then
+  echo "warning: could not stop $new; it is running. Orca's wake will use it as it is." >&2
+fi
+
+umask 077
+backup="$store.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+cp -p "$store" "$backup"
+tmp="$(mktemp "$store.XXXXXX")"
+trap 'rm -f "$events" "$tmp"' EXIT
+jq --arg id "$runtime_id" --arg new "$new" --argjson now "$(($(date +%s) * 1000))" '
+  .runtimes |= map(if .id == $id and .status != "cleaned"
+    then .recipeResult.userData.resourceId = $new | .status = "resume_failed" | .updatedAt = $now
+    else . end)' "$store" >"$tmp"
+chmod 600 "$tmp"
+mv -f "$tmp" "$store"
+[ "$(jq -r --arg id "$runtime_id" '.runtimes[] | select(.id == $id) | .recipeResult.userData.resourceId' "$store")" = "$new" ] ||
+  die "Orca changed the file at the same moment, so '$name' still points at $sandbox. The fork is $new; run this again or edit the file (backup: $backup)"
+old_delete="boat delete $sandbox"
+if [ -n "$org" ]; then old_delete="boat --org $org delete $sandbox"; fi
+echo "pointed '$name' at $new; backup: $backup"
+echo "Now click '$name' in Orca's sidebar. Resume pins the host key and restores the machine ID and git identity."
+echo "$sandbox is kept. Once you are sure nothing in it is needed, delete it with: $old_delete"

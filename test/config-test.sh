@@ -2,7 +2,8 @@
 # Free tests: no network and no boat account. boat is a stub (test/stubs/boat), HOME is a temp dir.
 # Covers config precedence, what a repo file may set, repo URL checks, preflight, lifecycle parsing,
 # failure cleanup, the sandbox's git identity and machine-ID scripts, the generated recipe commands
-# run the way Orca runs them (`sh -c`, stdin), and bin/orca-boat-wake.
+# run the way Orca runs them (`sh -c`, stdin), resume's snapshot recovery, bin/orca-boat-wake and
+# bin/orca-boat-recover.
 #
 #   bash test/config-test.sh
 # shellcheck disable=SC2016 # the snippets handed to lib_eval expand in the child shell, not here
@@ -169,6 +170,33 @@ reset
 repo_cfg '{"ghWrapper":"yes"}'
 lib_eval "$load_values"
 expect_fails "ghWrapper must be true or false"
+
+show_recovery='REPO_SLUG=acme/widgets; load_config; printf "%s\n" "$RECOVERY"'
+reset
+lib_eval "$show_recovery"
+expect_eq "recovery is off by default" "off" "$OUT"
+expect_eq "...and logs nothing" "" "$ERR"
+repo_cfg '{"recovery":"snapshot"}'
+lib_eval "$show_recovery"
+expect_eq "the repo file turns recovery on" "snapshot" "$OUT"
+expect_has "...and the log names the file" "$ERR" "recovery = snapshot (from $REPO_FILE)"
+user_cfg '{"repos":{"acme/widgets":{"recovery":"off"}}}'
+lib_eval "$show_recovery"
+expect_eq "the user file's repo entry beats the repo file" "off" "$OUT"
+EXTRA_ENV="ORCA_BOAT_RECOVERY=snapshot"
+lib_eval "$show_recovery"
+expect_eq "ORCA_BOAT_RECOVERY beats both" "snapshot" "$OUT"
+reset
+user_cfg '{"defaults":{"recovery":"snapshot"}}'
+lib_eval "$show_recovery"
+expect_eq "user defaults can turn recovery on" "snapshot" "$OUT"
+for bad in on true fork Snapshot; do
+  reset
+  repo_cfg "{\"recovery\":\"$bad\"}"
+  lib_eval "$show_recovery"
+  expect_fails "recovery '$bad' is refused"
+done
+expect_has "...and the error names the allowed values and the source" "$ERR" "invalid recovery 'Snapshot' (from $REPO_FILE): use off or snapshot"
 
 for bad in '../x.sh' '/etc/passwd' '-rf' 'a/../b.sh' 'a//b.sh' 'a/./b.sh' 'has space.sh' 'semi;colon.sh'; do
   reset
@@ -425,8 +453,22 @@ printf '%s' '{"recipeResult":{"userData":{"resourceId":"bx_ab12cd34","org":"a;b"
 lib_eval "$read_back"
 expect_fails "lifecycle org with shell characters is refused"
 
+lib_eval 'ORG=""; GH_WRAPPER=true; RECOVERY=snapshot; SSH_HOST=h; SSH_PORT=22; SSH_USER=user; IDENTITY_FILE=/k/id
+  emit_ssh_result bx_ab12cd34 /home/user/widgets'
+expect_eq "result records recovery when it is snapshot" "snapshot" "$(printf '%s' "$OUT" | jq -r '.userData.recovery')"
+printf '%s' "$OUT" | jq -c '{recipeResult: .}' >"$TMP/payload"
+lib_eval 'read_lifecycle; echo "$RECOVERY"'
+expect_eq "...and resume reads it back from that result" "snapshot" "$OUT"
+printf '%s' '{"recipeResult":{"userData":{"resourceId":"bx_ab12cd34","recovery":"fork"}}}' >"$TMP/payload"
+lib_eval 'read_lifecycle; echo "$RECOVERY"'
+expect_eq "a lifecycle recovery other than snapshot means off" "off" "$OUT"
+printf '%s' '{"recipeResult":{"userData":{"resourceId":"bx_ab12cd34"}}}' >"$TMP/payload"
+lib_eval 'read_lifecycle; echo "$RECOVERY"'
+expect_eq "a workspace made before 1.0.4 has recovery off" "off" "$OUT"
+
 lib_eval 'ORG=""; GH_WRAPPER=true; SSH_HOST=h; SSH_PORT=22; SSH_USER=user; IDENTITY_FILE=/k/id
   GIT_NAME="Ada Lovelace"; GIT_EMAIL=ada@example.com; emit_ssh_result bx_ab12cd34 /home/user/widgets'
+expect_eq "result leaves recovery out when it is off" "false" "$(printf '%s' "$OUT" | jq '.userData | has("recovery")')"
 expect_eq "result keeps the git identity in userData" "true" \
   "$(printf '%s' "$OUT" | jq '.userData.gitName == "Ada Lovelace" and .userData.gitEmail == "ada@example.com"')"
 read_identity='read_lifecycle; printf "%s|%s\n" "$GIT_NAME" "$GIT_EMAIL"'
@@ -967,6 +1009,87 @@ run_recipe resume
 expect_fails "resume fails when boat resume fails"
 expect_has "...and shows boat's own output" "$ERR" "boat resume failed: {\"event\":\"resumed\"}"
 expect_eq "...with nothing on stdout" "" "$OUT"
+expect_has "...and points at recovery" "$ERR" "set recovery to snapshot"
+expect_has "...and at orca-boat-recover" "$ERR" "orca-boat-recover"
+expect_lacks "...without trying to recover or fork" "$(cat "$LOG")" "recover bx_"
+expect_lacks "...nor forking" "$(cat "$LOG")" "fork"
+
+# --- resume with recovery: snapshot -----------------------------------------------------------------
+FORK_ID=bx_ef56ab78
+recovery_resume() { # -> a stub sandbox whose workspace has recovery on; the fork's host key is known to boat
+  reset
+  fake_sandbox
+  fixture fork.json "{\"event\":\"created\",\"sandbox\":{\"id\":\"$FORK_ID\"}}
+{\"event\":\"ready\",\"sandbox\":{\"id\":\"$FORK_ID\"}}"
+  fixture recover.json '{"event":"recovered"}'
+  printf 'ascii-sandbox-y ssh-ed25519 AAAAforkkey\n' \
+    >"$HOME_DIR/.ssh/ascii_sandbox_known_hosts/$(printf '%s' "$FORK_ID" | shasum -a 256 | cut -c1-24)"
+  printf '%s' "$life" | jq -c --arg k "$DEFAULT_KEY" '.recipeResult.connection.target.identityFile = $k
+    | .recipeResult.userData += {recovery: "snapshot"}' >"$TMP/payload"
+  STDIN_FILE="$TMP/payload"
+}
+
+# A power cycle is enough: the first resume fails, the one after boat recover works.
+recovery_resume
+fixture resume.json.1 '{"event":"error","error":"recover_unsupported"}'
+printf '1' >"$STUB_DIR/resume.json.1.rc"
+run_recipe resume
+expect_ok "recovery: resume works after a power cycle"
+expect_has "...runs boat recover in the sandbox's org" "$(cat "$LOG")" "--org Acme recover bx_ab12cd34 --json"
+expect_lacks "...and forks nothing" "$(cat "$LOG")" "fork"
+expect_has "...and says the disk was not touched" "$ERR" "its disk was not touched"
+expect_eq "...and returns the same sandbox, keeping recovery on" "bx_ab12cd34|snapshot" \
+  "$(printf '%s' "$OUT" | jq -r '"\(.userData.resourceId)|\(.userData.recovery)"')"
+
+# The power cycle does not help: the latest snapshot is forked, and Orca gets the fork.
+recovery_resume
+printf '1' >"$STUB_DIR/resume.json.rc"
+run_recipe resume
+expect_ok "recovery: resume forks the latest snapshot when a power cycle does not help"
+expect_eq "...prints one JSON line on stdout" "yes" "$(if is_one_json_line "$OUT"; then echo yes; else echo no; fi)"
+expect_eq "...whose resourceId is the fork, with recovery still on" "$FORK_ID|snapshot" \
+  "$(printf '%s' "$OUT" | jq -r '"\(.userData.resourceId)|\(.userData.recovery)"')"
+expect_eq "...and whose label is the fork's" "boat-$FORK_ID" "$(printf '%s' "$OUT" | jq -r '.connection.target.label')"
+expect_has "...forks the stuck sandbox in its org without a size or environment" "$(cat "$LOG")" \
+  "--org Acme fork --json --no-auto-stop --wait bx_ab12cd34"
+expect_lacks "...so the fork inherits them" "$(cat "$LOG")" "fork --json --type"
+expect_eq "...power-cycles before it forks" "yes" "$(awk '/ recover bx_ab12cd34/ && !r { r = NR } / fork / && !f { f = NR }
+  END { print (r && f && r < f) ? "yes" : "no" }' "$LOG")"
+expect_has "...pins the fork's own host key" "$(cat "$HOME_DIR/.ssh/known_hosts")" "203.0.113.9 ssh-ed25519 AAAAforkkey"
+expect_has "...authorizes the key on the fork" "$(cat "$LOG")" "--org Acme ssh $FORK_ID true"
+expect_has "...warns that disk changes after the snapshot are lost" "$ERR" "Changes on its disk made after that snapshot are not on the fork"
+expect_has "...says the stuck sandbox is kept and how to delete it" "$ERR" "bx_ab12cd34 is kept"
+expect_has "...with the org in the delete command" "$ERR" "boat --org Acme delete bx_ab12cd34"
+expect_lacks "...and deletes nothing" "$(cat "$LOG")" "delete"
+
+# boat recover itself fails: straight to the fork.
+recovery_resume
+printf '1' >"$STUB_DIR/resume.json.rc"
+printf '1' >"$STUB_DIR/recover.json.rc"
+run_recipe resume
+expect_ok "recovery: resume forks when boat recover fails too"
+expect_eq "...and returns the fork" "$FORK_ID" "$(printf '%s' "$OUT" | jq -r '.userData.resourceId')"
+expect_has "...showing why recover failed" "$ERR" "boat recover failed"
+
+# No snapshot to fork: fail loudly and leave Orca on the old sandbox.
+recovery_resume
+printf '1' >"$STUB_DIR/resume.json.rc"
+printf '1' >"$STUB_DIR/fork.json.rc"
+fixture fork.json '{"event":"error","error":"no snapshot"}'
+run_recipe resume
+expect_fails "recovery: resume fails when the fork fails"
+expect_eq "...with nothing on stdout" "" "$OUT"
+expect_has "...and says why" "$ERR" "boat fork failed (exit 1): no snapshot"
+expect_has "...and what failed" "$ERR" "could not fork bx_ab12cd34 from its latest snapshot"
+expect_lacks "...and never deletes anything" "$(cat "$LOG")" "delete"
+
+# A resume that works never reaches recovery, whatever the setting.
+recovery_resume
+run_recipe resume
+expect_ok "recovery on, resume fine: resume runs as usual"
+expect_lacks "...with no recover or fork" "$(cat "$LOG")" "recover bx_"
+expect_lacks "...nor forking" "$(cat "$LOG")" "fork"
+expect_eq "...returning the same sandbox" "bx_ab12cd34" "$(printf '%s' "$OUT" | jq -r '.userData.resourceId')"
 
 # --- bin/orca-boat-wake -------------------------------------------------------------------------
 STORE="$TMP/orca/orca-ephemeral-vm-runtimes.json"
@@ -1056,5 +1179,113 @@ RC=0
 ERR="$(env -i PATH="$BASE_PATH" HOME="$HOME_DIR" bash "$ROOT/bin/orca-boat-wake" --store "$TMP/missing.json" 2>&1)" || RC=$?
 expect_fails "wake helper without Orca's file fails"
 expect_has "...and names --store" "$ERR" "--store FILE"
+
+# --- bin/orca-boat-recover ----------------------------------------------------------------------
+recover() { # args...
+  RC=0
+  OUT="$(env -i PATH="$BASE_PATH" HOME="$HOME_DIR" BOAT_STUB_DIR="$STUB_DIR" BOAT_STUB_LOG="$LOG" \
+    bash "$ROOT/bin/orca-boat-recover" --store "$STORE" "$@" 2>"$TMP/err")" || RC=$?
+  ERR="$(cat "$TMP/err")"
+}
+resourceid_of() { jq -r --arg id "$1" '.runtimes[] | select(.id == $id) | .recipeResult.userData.resourceId' "$STORE"; }
+stuck_sandbox() {
+  reset
+  new_store
+  fixture info.json '{"sandbox":{"state":"stopping","health":"unresponsive"}}'
+  fixture snapshot-latest.json '{"snapshot":{"id":"snap_1","completedAt":"2026-11-11T10:00:00Z"}}'
+  fixture fork.json "{\"event\":\"created\",\"sandbox\":{\"id\":\"$FORK_ID\"}}
+{\"event\":\"ready\",\"sandbox\":{\"id\":\"$FORK_ID\"}}"
+  fixture stop.json '{"event":"stopped"}'
+}
+
+stuck_sandbox
+recover
+expect_ok "recover helper lists Orca's boat workspaces"
+expect_has "...like the wake helper" "$OUT" "bx_ab12cd34  running        203.0.113.9:19044"
+expect_eq "...and changes nothing" "yes" "$(store_unchanged)"
+
+stuck_sandbox
+recover refactor
+expect_ok "recover helper forks a stuck sandbox"
+expect_has "...shows boat's view of it" "$OUT" "boat: bx_ab12cd34 is stopping (health: unresponsive); Orca shows 'refactor' as running"
+expect_has "...and when the snapshot it forks was taken" "$OUT" "latest snapshot of bx_ab12cd34: 2026-11-11T10:00:00Z. Disk changes made after it are not on the fork."
+expect_eq "...points the workspace at the fork" "$FORK_ID" "$(resourceid_of orca-1)"
+expect_eq "...and marks it as needing a wake" "resume_failed" "$(status_of orca-1)"
+expect_eq "...with a new updatedAt" "true" "$(jq '.runtimes[] | select(.id == "orca-1") | .updatedAt > 1' "$STORE")"
+expect_eq "...leaves every other record as it was" "$(others_of orca-1 "$TMP/store-before")" "$(others_of orca-1 "$STORE")"
+expect_eq "...changes nothing else in that record" "true" "$(jq --slurpfile before "$TMP/store-before" '
+  (.runtimes[] | select(.id == "orca-1") | del(.status, .updatedAt, .recipeResult.userData.resourceId))
+  == ($before[0].runtimes[] | select(.id == "orca-1") | del(.status, .updatedAt, .recipeResult.userData.resourceId))' "$STORE")"
+expect_eq "...keeps the file private" "$STORE" "$(find "$STORE" -perm 0600)"
+expect_eq "...after a backup of the original" "yes" \
+  "$(cmp -s "$(find "$TMP/orca" -name '*.bak-*')" "$TMP/store-before" && echo yes || echo no)"
+expect_has "...forks in the workspace's org, inheriting size and environment" "$(cat "$LOG")" \
+  "--org Acme fork --json --no-auto-stop --wait bx_ab12cd34"
+expect_has "...stops the fork so resume finds it asleep" "$(cat "$LOG")" "--org Acme stop $FORK_ID --json"
+expect_eq "...forks before it stops" "yes" "$(awk '/ fork / && !f { f = NR } / stop / && !s { s = NR }
+  END { print (f && s && f < s) ? "yes" : "no" }' "$LOG")"
+expect_has "...says what to click" "$OUT" "Now click 'refactor' in Orca's sidebar"
+expect_has "...keeps the stuck sandbox and says how to delete it" "$OUT" "boat --org Acme delete bx_ab12cd34"
+expect_lacks "...and deletes nothing" "$(cat "$LOG")" "delete bx_"
+
+stuck_sandbox
+recover bx_ab12cd34
+expect_eq "recover helper finds a workspace by sandbox id" "$FORK_ID" "$(resourceid_of orca-1)"
+
+stuck_sandbox
+recover --dry-run refactor
+expect_ok "recover helper --dry-run"
+expect_has "...says what it would do" "$OUT" "dry run: would fork bx_ab12cd34"
+expect_lacks "...forks nothing" "$(cat "$LOG")" "fork"
+expect_eq "...and changes nothing" "yes|0" "$(store_unchanged)|$(backups)"
+
+stuck_sandbox
+fixture info.json '{"sandbox":{"state":"ready","health":"ok"}}'
+recover refactor
+expect_fails "recover helper refuses a healthy sandbox"
+expect_has "...and suggests the wake helper or --force" "$ERR" "orca-boat-wake"
+expect_lacks "...forking nothing" "$(cat "$LOG")" "fork"
+expect_eq "...and changing nothing" "yes|0" "$(store_unchanged)|$(backups)"
+recover --force refactor
+expect_ok "recover helper --force forks a healthy sandbox"
+expect_eq "...and points the workspace at the fork" "$FORK_ID" "$(resourceid_of orca-1)"
+
+stuck_sandbox
+fixture snapshot-latest.json '{"snapshot":null}'
+recover refactor
+expect_fails "recover helper refuses a sandbox with no snapshot"
+expect_has "...and says so" "$ERR" "no snapshot of bx_ab12cd34 to fork from"
+expect_lacks "...forking nothing" "$(cat "$LOG")" "fork"
+expect_eq "...and changing nothing" "yes|0" "$(store_unchanged)|$(backups)"
+
+stuck_sandbox
+fixture fork.json '{"event":"error","error":"no_ready_machine"}'
+printf '1' >"$STUB_DIR/fork.json.rc"
+recover refactor
+expect_fails "recover helper fails when the fork fails"
+expect_has "...with boat's reason" "$ERR" "boat fork failed (exit 1): no_ready_machine"
+expect_eq "...and changing nothing" "yes|0" "$(store_unchanged)|$(backups)"
+
+stuck_sandbox
+printf '1' >"$STUB_DIR/stop.json.rc"
+recover refactor
+expect_ok "recover helper still switches to a fork it could not stop"
+expect_has "...with a warning" "$ERR" "warning: could not stop $FORK_ID"
+expect_eq "...and points the workspace at it" "$FORK_ID" "$(resourceid_of orca-1)"
+
+stuck_sandbox
+recover sleepy
+expect_ok "recover helper handles a workspace that is asleep"
+expect_eq "...pointing it at the fork" "$FORK_ID" "$(resourceid_of orca-2)"
+stuck_sandbox
+recover broken
+expect_fails "recover helper refuses a workspace that failed to be created"
+recover twin
+expect_fails "recover helper refuses a name two workspaces share"
+expect_has "...and asks for the sandbox id" "$ERR" "use the sandbox id"
+recover nope
+expect_fails "recover helper refuses an unknown workspace"
+expect_eq "...and none of these changed the file" "yes|0" "$(store_unchanged)|$(backups)"
+
 printf '\n%s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]

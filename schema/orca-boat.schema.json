@@ -36,6 +36,11 @@
       "type": "boolean",
       "default": true,
       "description": "Install the gh wrapper that keeps Orca's GitHub actions working after boat's GitHub token expires."
+    },
+    "recovery": {
+      "enum": ["off", "snapshot"],
+      "default": "off",
+      "description": "What waking a sandbox boat cannot resume does. snapshot: power-cycle it, and if that fails fork the workspace's latest disk snapshot into a new sandbox, losing disk changes made after that snapshot. The old sandbox is kept. Read when the workspace is created, so it does not apply to older workspaces."
     }
   }
 }
