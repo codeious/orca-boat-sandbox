@@ -9,6 +9,7 @@
 #   checkout + setup script -> exit code from $BOAT_STUB_DIR/ssh-checkout.rc (default 0)
 #   machine ID restore      -> prints $BOAT_STUB_DIR/ssh-machine-id.out (default "same"), then exits
 #                              with the code from $BOAT_STUB_DIR/ssh-machine-id.rc (default 0)
+#   orcad lock repair       -> prints $BOAT_STUB_DIR/ssh-orcad-locks.out (default 0)
 set -u
 dir="${BOAT_STUB_DIR:?}"
 printf '%s\n' "$*" >>"$dir/ssh.log"
@@ -20,6 +21,9 @@ remote="${args[$((${#args[@]} - 1))]}"
 script="$(cat)"
 printf '%s\n-----\n' "$script" >>"$dir/ssh-scripts.log"
 case "$script" in
+  *'repair_orcad_locks() {'*)
+    if [ -f "$dir/ssh-orcad-locks.out" ]; then cat "$dir/ssh-orcad-locks.out"; else echo 0; fi
+    ;;
   *'restore_machine_id'*)
     if [ -f "$dir/ssh-machine-id.out" ]; then cat "$dir/ssh-machine-id.out"; else echo same; fi
     rc=0

@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Test double for launchctl. Appends its arguments to $BOAT_STUB_DIR/launchctl.log and keeps the
+# loaded labels in $BOAT_STUB_DIR/launchctl-loaded, one per line.
+set -u
+dir="${BOAT_STUB_DIR:?}"
+printf '%s\n' "$*" >>"$dir/launchctl.log"
+loaded="$dir/launchctl-loaded"
+touch "$loaded"
+case "${1:-}" in
+  print) grep -qxF "${2##*/}" "$loaded" ;;
+  bootstrap)
+    label="$(basename "${3:?}" .plist)"
+    grep -qxF "$label" "$loaded" || printf '%s\n' "$label" >>"$loaded"
+    ;;
+  bootout)
+    grep -vxF "${2##*/}" "$loaded" >"$loaded.tmp" || true
+    mv -f "$loaded.tmp" "$loaded"
+    ;;
+  *) exit 0 ;;
+esac

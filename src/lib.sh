@@ -210,7 +210,7 @@ load_config() {
   load_setting MACHINE_TYPE machineType ORCA_BOAT_MACHINE_TYPE default
   load_setting SETUP_SCRIPT setupScript ORCA_BOAT_SETUP_SCRIPT ""
   load_setting GH_WRAPPER ghWrapper ORCA_BOAT_GH_WRAPPER true
-  load_setting RECOVERY recovery ORCA_BOAT_RECOVERY off
+  load_setting RECOVERY recovery ORCA_BOAT_RECOVERY snapshot
   load_setting SSH_USER sshUser ORCA_BOAT_SSH_USER user
   load_setting IDENTITY_FILE identityFile ORCA_BOAT_IDENTITY_FILE "$HOME/.ssh/ascii_box_ed25519"
   IDENTITY_FILE="${IDENTITY_FILE/#\~/$HOME}"
@@ -405,6 +405,11 @@ install_failure_cleanup() {
   trap on_exit EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
+}
+
+# "baremetal" for a sandbox on a bare-metal machine, which boat cannot power-cycle (recover_unsupported).
+machine_provider() { # id
+  boat_cli info "$1" --json 2>/dev/null | jq -r '.sandbox.machineProvider // empty' 2>/dev/null || true
 }
 
 sandbox_state() { # id
@@ -745,6 +750,53 @@ machine_id_restore_script() {
 MACHINEID
 }
 
+# --- Orca's server (orcad) on the sandbox ------------------------------------------------------
+# orcad refuses to start while ~/.orca/orcad.lock (or ~/.orca-<hash>/orcad.lock) names another
+# server, and it does not notice that the server in the lock died with the previous boot. A lock
+# is stale when its boot id is not this boot's, its pid is gone, or that pid started at another
+# time (linuxStartTicks); a live server's lock is never touched.
+
+# Prints sandbox functions: repair_orcad_locks moves every stale lock to ~/.orca-recovery and
+# prints how many it moved; kick_orcad_unit starts the plugin's orcad service when it is installed
+# and not running. Neither fails.
+orcad_repair_script() {
+  cat <<'ORCAD'
+  orcad_lock_field() { sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\).*/\1/p" "$1" 2>/dev/null | head -n 1; }
+  orcad_lock_live() { # lock
+    local pid boot ticks now
+    pid="$(orcad_lock_field "$1" pid)"
+    boot="$(orcad_lock_field "$1" bootId)"
+    ticks="$(orcad_lock_field "$1" linuxStartTicks)"
+    case "$pid" in '' | *[!0-9]*) return 1 ;; esac
+    if [ -n "$boot" ] && [ "$boot" != "$(cat "${ORCA_BOAT_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}" 2>/dev/null)" ]; then return 1; fi
+    kill -0 "$pid" 2>/dev/null || return 1
+    if [ -n "$ticks" ] && [ -r "/proc/$pid/stat" ]; then
+      now="$(sed 's/^.*) //' "/proc/$pid/stat" | awk '{ print $20 }')"
+      [ "$now" = "$ticks" ] || return 1
+    fi
+  }
+  repair_orcad_locks() {
+    local lock dest n=0
+    for lock in "$HOME"/.orca/orcad.lock "$HOME"/.orca-*/orcad.lock; do
+      [ -f "$lock" ] || continue
+      if orcad_lock_live "$lock"; then continue; fi
+      dest="$HOME/.orca-recovery/stale-orcad-$(basename "$(dirname "$lock")" | tr -d .)-$(date +%s)-$n.lock"
+      if mkdir -p "$HOME/.orca-recovery" && mv -f "$lock" "$dest"; then
+        n=$((n + 1))
+      else
+        echo "warning: could not move the stale lock $lock" >&2
+      fi
+    done
+    echo "$n"
+  }
+  kick_orcad_unit() {
+    systemctl --user cat orca-boat-orcad.service >/dev/null 2>&1 || return 0
+    systemctl --user is-active --quiet orca-boat-orcad.service && return 0
+    systemctl --user restart orca-boat-orcad.service >/dev/null 2>&1 || echo "warning: could not start orca-boat-orcad.service" >&2
+  }
+ORCAD
+}
+
 # --- Orca contract ---------------------------------------------------------------------------
 
 # Orca owns the checkout in provisioned-root mode, so every result is schema 2 with that mode.
@@ -770,9 +822,24 @@ emit_ssh_result() { # id project_root
       },
       userData: ({provider: "boat", resourceId: $id, projectRoot: $root, ghWrapper: $gh}
         + (if $org == "" then {} else {org: $org} end)
-        + (if $rec == "snapshot" then {recovery: $rec} else {} end)
+        + (if $rec == "" then {} else {recovery: $rec} end)
         + (if $gn == "" then {} else {gitName: $gn, gitEmail: $ge} end))
     }'
+}
+
+# For a workspace whose record has no recovery: ORCA_BOAT_RECOVERY, else the user file's defaults,
+# else off. The repo is not known in a lifecycle phase, so the per-repo layers do not apply.
+legacy_recovery() {
+  local value="${ORCA_BOAT_RECOVERY:-}" source=ORCA_BOAT_RECOVERY
+  if [ -z "$value" ]; then
+    value="$(config_get "$USER_CONFIG" .defaults recovery 2>/dev/null || true)"
+    source="$USER_CONFIG, defaults"
+  fi
+  case "$value" in
+    off | snapshot) log "recovery: this workspace has no recorded setting; using $value (from $source)" ;;
+    *) value=off ;;
+  esac
+  RECOVERY="$value"
 }
 
 # Reads the lifecycle JSON Orca writes to stdin and sets LIFECYCLE_ID, LIFECYCLE_ROOT, ORG,
@@ -803,8 +870,9 @@ read_lifecycle() {
   if [ -n "$identity" ]; then IDENTITY_FILE="$identity"; fi
   GH_WRAPPER="$(printf '%s' "$payload" |
     jq -r 'if .recipeResult.userData.ghWrapper == false then "false" else "true" end')"
-  RECOVERY="$(printf '%s' "$payload" |
-    jq -r 'if .recipeResult.userData.recovery == "snapshot" then "snapshot" else "off" end')"
+  # Empty for a workspace made before 1.1.0, which recorded recovery only when it was snapshot.
+  RECOVERY="$(printf '%s' "$payload" | jq -r '(.recipeResult.userData.recovery // "") as $r
+    | if $r == "snapshot" or $r == "off" or $r == "" then $r else "off" end')"
   name="$(printf '%s' "$payload" | jq -r '.recipeResult.userData.gitName // empty')"
   email="$(printf '%s' "$payload" | jq -r '.recipeResult.userData.gitEmail // empty')"
   if valid_git_identity "$name" "$email"; then

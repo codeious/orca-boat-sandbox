@@ -13,17 +13,45 @@ try_resume() { # id wait_seconds
   return 1
 }
 
-# Without recovery a sandbox boat cannot resume ends the wake. With it, the disk-preserving step
-# comes first, so a hang that a power cycle clears costs no data; only then is the latest snapshot
-# forked. The old sandbox is never deleted, and no trap here deletes the fork.
+stop_then_resume() { # id [--force]
+  boat_quiet stop "$1" ${2:+"$2"} --json && wait_for_state "$1" "${ORCA_BOAT_STOP_WAIT:-900}" 'stopped|archived' &&
+    try_resume "$1" 300
+}
+
+# Steps that keep the disk come first: a power cycle (which boat refuses on bare metal), then a
+# normal stop, which boat can take minutes to finish. Only with recovery set to snapshot do the
+# steps that go back to the latest snapshot follow: a forced stop, then a fork. The old sandbox is
+# never deleted, and no trap here deletes the fork.
+if [ -z "$RECOVERY" ]; then legacy_recovery; fi
 log "resuming $id"
 if ! try_resume "$id" 300; then
-  [ "$RECOVERY" = snapshot ] ||
-    die "boat cannot resume $id. To recover it from its latest snapshot, set recovery to snapshot (see Recovering an unrecoverable sandbox in the plugin README), or run orca-boat-recover"
-  log "recovery: $id would not resume; power-cycling it with boat recover"
-  if boat_quiet recover "$id" --json && try_resume "$id" 180; then
-    log "recovery: $id is back after a power cycle; its disk was not touched"
+  recovered=0
+  if [ "$(machine_provider "$id")" = baremetal ]; then
+    log "recovery: $id is on a bare-metal machine, which boat cannot power-cycle; skipping boat recover"
   else
+    log "recovery: $id would not resume; power-cycling it with boat recover"
+    if boat_quiet recover "$id" --json && try_resume "$id" 180; then
+      recovered=1
+      log "recovery: $id is back after a power cycle; its disk was not touched"
+    fi
+  fi
+  if [ "$recovered" = 0 ]; then
+    log "recovery: stopping $id and starting it again; a normal stop keeps its disk"
+    if stop_then_resume "$id"; then
+      recovered=1
+      log "recovery: $id is back after a stop; its disk was not touched"
+    fi
+  fi
+  if [ "$recovered" = 0 ]; then
+    [ "$RECOVERY" = snapshot ] ||
+      die "boat cannot resume $id. To recover it from its latest snapshot, set recovery to snapshot (see Recovering an unrecoverable sandbox in the plugin README), or run orca-boat fix"
+    log "recovery: force-stopping $id. Changes on its disk made after its latest snapshot are lost"
+    if stop_then_resume "$id" --force; then
+      recovered=1
+      log "recovery: $id is back after a forced stop, at its latest snapshot"
+    fi
+  fi
+  if [ "$recovered" = 0 ]; then
     log "recovery: forking the latest snapshot of $id. Changes on its disk made after that snapshot are not on the fork"
     fork_sandbox "$id" || die "recovery failed: could not fork $id from its latest snapshot"
     [ -n "$SANDBOX_ID" ] && [ "$SANDBOX_ID" != "$id" ] || die "recovery failed: boat did not report a new sandbox for the fork of $id"
@@ -58,6 +86,17 @@ case "$machine_id" in
   failed) log "warning: boat changed the sandbox's machine ID and it could not be put back; Orca may report orcad_identity_mismatch" ;;
   unknown) log "warning: the sandbox's machine ID matches none Orca's server could belong to; if Orca reports orcad_identity_mismatch, see Troubleshooting in the plugin README" ;;
   *) log "warning: could not check the sandbox's machine ID" ;;
+esac
+# A server that died with the previous boot leaves its lock behind, and the next one will not start.
+orcad_locks="$({
+  orcad_repair_script
+  echo repair_orcad_locks
+  echo kick_orcad_unit
+} | ssh_remote 'bash -s' | tail -n 1 || true)"
+case "$orcad_locks" in
+  '' | 0) ;;
+  *[!0-9]*) log "warning: could not check Orca's server locks on the sandbox" ;;
+  *) log "moved $orcad_locks stale Orca server lock(s) to ~/.orca-recovery; they belonged to a server that is gone" ;;
 esac
 # Puts back the git identity from create if the sandbox has lost it; one it has wins.
 if [ -n "$GIT_NAME" ]; then

@@ -2,8 +2,8 @@
 # Free tests: no network and no boat account. boat is a stub (test/stubs/boat), HOME is a temp dir.
 # Covers config precedence, what a repo file may set, repo URL checks, preflight, lifecycle parsing,
 # failure cleanup, the sandbox's git identity and machine-ID scripts, the generated recipe commands
-# run the way Orca runs them (`sh -c`, stdin), resume's snapshot recovery, bin/orca-boat-wake and
-# bin/orca-boat-recover.
+# run the way Orca runs them (`sh -c`, stdin), resume's recovery steps, the sandbox's orcad lock
+# repair, bin/orca-boat (orca and launchctl stubbed too), bin/orca-boat-wake and bin/orca-boat-recover.
 #
 #   bash test/config-test.sh
 # shellcheck disable=SC2016 # the snippets handed to lib_eval expand in the child shell, not here
@@ -174,7 +174,7 @@ expect_fails "ghWrapper must be true or false"
 show_recovery='REPO_SLUG=acme/widgets; load_config; printf "%s\n" "$RECOVERY"'
 reset
 lib_eval "$show_recovery"
-expect_eq "recovery is off by default" "off" "$OUT"
+expect_eq "recovery is snapshot by default" "snapshot" "$OUT"
 expect_eq "...and logs nothing" "" "$ERR"
 repo_cfg '{"recovery":"snapshot"}'
 lib_eval "$show_recovery"
@@ -423,7 +423,7 @@ expect_eq "result shape without an org" "true" "$(printf '%s' "$OUT" | jq '
   .schemaVersion == 2 and .checkoutMode == "provisioned-root" and .connection.type == "ssh"
   and .connection.projectRoot == "/home/user/widgets"
   and .connection.target == {label: "boat-bx_ab12cd34", host: "203.0.113.9", port: 2222, username: "user", identityFile: "/k/id", identitiesOnly: true}
-  and .userData == {provider: "boat", resourceId: "bx_ab12cd34", projectRoot: "/home/user/widgets", ghWrapper: true}')"
+  and .userData == {provider: "boat", resourceId: "bx_ab12cd34", projectRoot: "/home/user/widgets", ghWrapper: true, recovery: "off"}')"
 lib_eval 'ORG=Acme; GH_WRAPPER=false; SSH_HOST=h; SSH_PORT=22; SSH_USER=user; IDENTITY_FILE=/k/id
   emit_ssh_result bx_ab12cd34 /home/user/widgets'
 expect_eq "result keeps org and ghWrapper in userData" "true" \
@@ -464,11 +464,22 @@ lib_eval 'read_lifecycle; echo "$RECOVERY"'
 expect_eq "a lifecycle recovery other than snapshot means off" "off" "$OUT"
 printf '%s' '{"recipeResult":{"userData":{"resourceId":"bx_ab12cd34"}}}' >"$TMP/payload"
 lib_eval 'read_lifecycle; echo "$RECOVERY"'
-expect_eq "a workspace made before 1.0.4 has recovery off" "off" "$OUT"
+expect_eq "a workspace made before 1.1.0 has no recorded recovery" "" "$OUT"
+lib_eval 'legacy_recovery; echo "$RECOVERY"'
+expect_eq "...and without a setting resume treats it as off" "off" "$OUT"
+user_cfg '{"defaults":{"recovery":"snapshot"}}'
+lib_eval 'legacy_recovery; echo "$RECOVERY"'
+expect_eq "...or as the user file's default" "snapshot" "$OUT"
+expect_has "...and says where that came from" "$ERR" "using snapshot (from $USER_FILE, defaults)"
+EXTRA_ENV="ORCA_BOAT_RECOVERY=off"
+lib_eval 'legacy_recovery; echo "$RECOVERY"'
+expect_eq "...with ORCA_BOAT_RECOVERY above the user file" "off" "$OUT"
+EXTRA_ENV=""
+user_cfg '{}'
 
 lib_eval 'ORG=""; GH_WRAPPER=true; SSH_HOST=h; SSH_PORT=22; SSH_USER=user; IDENTITY_FILE=/k/id
   GIT_NAME="Ada Lovelace"; GIT_EMAIL=ada@example.com; emit_ssh_result bx_ab12cd34 /home/user/widgets'
-expect_eq "result leaves recovery out when it is off" "false" "$(printf '%s' "$OUT" | jq '.userData | has("recovery")')"
+expect_eq "result records recovery off too, so a later default cannot change it" "off" "$(printf '%s' "$OUT" | jq -r '.userData.recovery')"
 expect_eq "result keeps the git identity in userData" "true" \
   "$(printf '%s' "$OUT" | jq '.userData.gitName == "Ada Lovelace" and .userData.gitEmail == "ada@example.com"')"
 read_identity='read_lifecycle; printf "%s|%s\n" "$GIT_NAME" "$GIT_EMAIL"'
@@ -1010,9 +1021,40 @@ expect_fails "resume fails when boat resume fails"
 expect_has "...and shows boat's own output" "$ERR" "boat resume failed: {\"event\":\"resumed\"}"
 expect_eq "...with nothing on stdout" "" "$OUT"
 expect_has "...and points at recovery" "$ERR" "set recovery to snapshot"
-expect_has "...and at orca-boat-recover" "$ERR" "orca-boat-recover"
-expect_lacks "...without trying to recover or fork" "$(cat "$LOG")" "recover bx_"
+expect_has "...and at orca-boat fix" "$ERR" "orca-boat fix"
+expect_has "...after a power cycle" "$(cat "$LOG")" "--org Acme recover bx_ab12cd34 --json"
+expect_has "...and a normal stop, which keep the disk" "$(cat "$LOG")" "--org Acme stop bx_ab12cd34 --json"
+expect_lacks "...but no forced stop, with recovery off" "$(cat "$LOG")" "--force"
 expect_lacks "...nor forking" "$(cat "$LOG")" "fork"
+
+# Bare metal: boat refuses recover there, so resume goes straight to a normal stop, which works.
+reset
+fake_sandbox
+fixture info.json '{"sandbox":{"state":"ready","ip":"203.0.113.9","hydrated":true,"machineProvider":"baremetal"}}'
+fixture info.json.2 '{"sandbox":{"state":"stopped","machineProvider":"baremetal"}}'
+fixture resume.json.1 '{"event":"error","error":"unreachable"}'
+printf '1' >"$STUB_DIR/resume.json.1.rc"
+fixture stop.json '{"event":"stopped"}'
+printf '%s' "$life" | jq -c --arg k "$DEFAULT_KEY" '.recipeResult.connection.target.identityFile = $k' >"$TMP/payload"
+STDIN_FILE="$TMP/payload"
+run_recipe resume
+expect_ok "resume on bare metal recovers with a stop and a resume"
+expect_lacks "...without boat recover" "$(cat "$LOG")" "recover bx_"
+expect_has "...and says why" "$ERR" "bare-metal machine"
+expect_has "...stops it normally" "$(cat "$LOG")" "--org Acme stop bx_ab12cd34 --json"
+expect_has "...says the disk was not touched" "$ERR" "back after a stop; its disk was not touched"
+expect_eq "...and returns the same sandbox" "bx_ab12cd34" "$(printf '%s' "$OUT" | jq -r '.userData.resourceId')"
+
+reset
+fake_sandbox
+printf '%s' "$life" | jq -c --arg k "$DEFAULT_KEY" '.recipeResult.connection.target.identityFile = $k' >"$TMP/payload"
+STDIN_FILE="$TMP/payload"
+run_recipe resume
+expect_has "resume moves stale Orca server locks on the sandbox" "$(scripts_sent)" "repair_orcad_locks() {"
+expect_has "...and starts the plugin's orcad service when it is installed" "$(scripts_sent)" "kick_orcad_unit"
+echo 2 >"$STUB_DIR/ssh-orcad-locks.out"
+run_recipe resume
+expect_has "...and says how many it moved" "$ERR" "moved 2 stale Orca server lock(s)"
 
 # --- resume with recovery: snapshot -----------------------------------------------------------------
 FORK_ID=bx_ef56ab78
@@ -1053,6 +1095,8 @@ expect_eq "...and whose label is the fork's" "boat-$FORK_ID" "$(printf '%s' "$OU
 expect_has "...forks the stuck sandbox in its org without a size or environment" "$(cat "$LOG")" \
   "--org Acme fork --json --no-auto-stop --wait bx_ab12cd34"
 expect_lacks "...so the fork inherits them" "$(cat "$LOG")" "fork --json --type"
+expect_eq "...tries a normal and a forced stop before it forks" "yes" "$(awk '/ stop bx_ab12cd34 --json/ && !s { s = NR }
+  / stop bx_ab12cd34 --force/ && !x { x = NR } / fork / && !f { f = NR } END { print (s && x && f && s < x && x < f) ? "yes" : "no" }' "$LOG")"
 expect_eq "...power-cycles before it forks" "yes" "$(awk '/ recover bx_ab12cd34/ && !r { r = NR } / fork / && !f { f = NR }
   END { print (r && f && r < f) ? "yes" : "no" }' "$LOG")"
 expect_has "...pins the fork's own host key" "$(cat "$HOME_DIR/.ssh/known_hosts")" "203.0.113.9 ssh-ed25519 AAAAforkkey"
@@ -1061,6 +1105,23 @@ expect_has "...warns that disk changes after the snapshot are lost" "$ERR" "Chan
 expect_has "...says the stuck sandbox is kept and how to delete it" "$ERR" "bx_ab12cd34 is kept"
 expect_has "...with the org in the delete command" "$ERR" "boat --org Acme delete bx_ab12cd34"
 expect_lacks "...and deletes nothing" "$(cat "$LOG")" "delete"
+
+# A forced stop brings it back at its latest snapshot: no fork.
+recovery_resume
+fixture resume.json.1 '{"event":"error"}'
+printf '1' >"$STUB_DIR/resume.json.1.rc"
+printf '1' >"$STUB_DIR/recover.json.rc"
+fixture stop.json.1 '{"event":"error"}'
+printf '1' >"$STUB_DIR/stop.json.1.rc"
+fixture stop.json.2 '{"event":"stopped"}'
+fixture info.json.2 '{"sandbox":{"state":"stopped"}}'
+run_recipe resume
+expect_ok "recovery: a forced stop brings the sandbox back"
+expect_has "...after a normal stop failed" "$(cat "$LOG")" "--org Acme stop bx_ab12cd34 --json"
+expect_has "...forcing the second stop" "$(cat "$LOG")" "--org Acme stop bx_ab12cd34 --force --json"
+expect_has "...warning what is lost" "$ERR" "Changes on its disk made after its latest snapshot are lost"
+expect_lacks "...and forks nothing" "$(cat "$LOG")" "fork"
+expect_eq "...returning the same sandbox" "bx_ab12cd34" "$(printf '%s' "$OUT" | jq -r '.userData.resourceId')"
 
 # boat recover itself fails: straight to the fork.
 recovery_resume
@@ -1287,5 +1348,279 @@ recover nope
 expect_fails "recover helper refuses an unknown workspace"
 expect_eq "...and none of these changed the file" "yes|0" "$(store_unchanged)|$(backups)"
 
+# --- Orca server locks on the sandbox ----------------------------------------------------------------
+reset
+lib_eval 'orcad_repair_script'
+repair_script="$OUT"
+lock_home="$TMP/lockhome"
+rm -rf "$lock_home"
+mkdir -p "$lock_home/.orca" "$lock_home/.orca-7afce5c6"
+printf 'boot-1\n' >"$TMP/boot_id"
+sleep 300 &
+live_pid=$!
+sleep 0 &
+dead_pid=$!
+wait "$dead_pid" || true
+printf '{"pid":%s,"bootId":"boot-1","host":"box"}\n' "$live_pid" >"$lock_home/.orca/orcad.lock"
+printf '{"pid":%s,"bootId":"boot-1","host":"box"}\n' "$dead_pid" >"$lock_home/.orca-7afce5c6/orcad.lock"
+repair_locks() { HOME="$lock_home" ORCA_BOAT_BOOT_ID_FILE="$TMP/boot_id" bash -c "$repair_script
+repair_orcad_locks" 2>/dev/null; }
+expect_eq "lock repair moves the lock of a server that is gone" "1" "$(repair_locks)"
+expect_eq "...and keeps the lock of one that runs" "yes|no" \
+  "$([ -f "$lock_home/.orca/orcad.lock" ] && echo yes || echo no)|$([ -f "$lock_home/.orca-7afce5c6/orcad.lock" ] && echo yes || echo no)"
+expect_eq "...moving it to ~/.orca-recovery" "1" "$(find "$lock_home/.orca-recovery" -name 'stale-orcad-orca-7afce5c6-*.lock' | wc -l | tr -d ' ')"
+expect_eq "...and a second run finds nothing" "0" "$(repair_locks)"
+printf 'boot-2\n' >"$TMP/boot_id"
+expect_eq "a lock from an earlier boot is stale even when its pid is in use again" "1" "$(repair_locks)"
+printf '{"host":"box"}\n' >"$lock_home/.orca/orcad.lock"
+expect_eq "a lock without a pid is stale" "1" "$(repair_locks)"
+kill "$live_pid" 2>/dev/null || true
+wait "$live_pid" 2>/dev/null || true
+
+# --- bin/orca-boat ---------------------------------------------------------------------------------
+STORE="$TMP/orca/orca-ephemeral-vm-runtimes.json"
+AGENTS="$TMP/agents"
+LINK_ID=bx_9z8y7x6w
+LINK_LABEL="dev.codeious.orca.boat.$LINK_ID"
+# Orca has 'refactor' running on bx_ab12cd34 at 203.0.113.9:19044, where boat has it too, and
+# 'sleepy' asleep on bx_cd34ef56. boat, orca, launchctl and osascript are stubs.
+ob_reset() {
+  reset
+  rm -rf "$TMP/orca" "$AGENTS"
+  mkdir -p "$TMP/orca" "$AGENTS"
+  cp "$ROOT/test/stubs/orca" "$ROOT/test/stubs/launchctl" "$HOME_DIR/.ascii/bin/"
+  printf '#!/bin/sh\necho "$@" >>"$BOAT_STUB_DIR/notify.log"\n' >"$HOME_DIR/.ascii/bin/osascript"
+  chmod +x "$HOME_DIR/.ascii/bin/"*
+  printf '{"version":1,"runtimes":[%s,%s]}\n' "$(boat_runtime orca-1 running refactor bx_ab12cd34)" \
+    "$(boat_runtime orca-2 suspended sleepy bx_cd34ef56)" >"$STORE"
+  chmod 600 "$STORE"
+  cp "$STORE" "$TMP/store-before"
+  fixture info.json '{"sandbox":{"state":"idle","health":"ok","name":"widgets","sshEndpoint":"203.0.113.9:19044"}}'
+  fixture info-bx_cd34ef56.json '{"sandbox":{"state":"stopped","health":"ok"}}'
+  fixture exec-probe.json '{"exitCode":0,"stdout":"unit=none\nlisten=no\nstale=0\n"}'
+  fixture exec-locks.json '{"exitCode":0,"stdout":"moved=0\n"}'
+  fixture orca-env-list.json '{"result":{"environments":[]}}'
+  fixture orca-status.json '{"result":{"runtime":{"connectionState":"connected"}}}'
+  fixture resume.json '{"event":"resumed"}'
+  fixture stop.json '{"event":"stopped"}'
+}
+ob() { # args...
+  RC=0
+  # shellcheck disable=SC2086 # EXTRA_ENV is a list of VAR=value words
+  OUT="$(env -i PATH="$BASE_PATH" HOME="$HOME_DIR" BOAT_STUB_DIR="$STUB_DIR" BOAT_STUB_LOG="$LOG" \
+    ORCA_BOAT_LAUNCH_AGENTS="$AGENTS" ORCA_BOAT_POLL=0 ORCA_BOAT_STOP_WAIT=0 ORCA_BOAT_RESUME_WAIT=0 \
+    ORCA_BOAT_CONNECT_WAIT=0 $EXTRA_ENV bash "$ROOT/bin/orca-boat" --store "$STORE" "$@" 2>"$TMP/err")" || RC=$?
+  ERR="$(cat "$TMP/err")"
+}
+link_plist() { # id local_port: a forward written by `orca-boat link`
+  cat >"$AGENTS/dev.codeious.orca.boat.$1.plist" <<PLIST
+<plist version="1.0"><dict>
+  <key>Label</key>
+  <string>dev.codeious.orca.boat.$1</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/x/boat</string>
+    <string>--no-update</string>
+    <string>forward</string>
+    <string>$1</string>
+    <string>--remote</string>
+    <string>6768</string>
+    <string>--local</string>
+    <string>$2</string>
+    <string>--bind</string>
+    <string>127.0.0.1</string>
+  </array>
+</dict></plist>
+PLIST
+}
+linked_env() { # -> Orca has environment env-1 on ws://127.0.0.1:61190
+  fixture orca-env-list.json '{"result":{"environments":[{"id":"env-1","name":"boat-bx_9z8y7x6w widgets","endpoints":[{"endpoint":"ws://127.0.0.1:61190"}]}]}}'
+}
+broken_sandbox() { # -> boat reports bx_ab12cd34 unreachable on bare metal and resume fails
+  fixture info.json '{"sandbox":{"state":"idle","health":"error","healthReason":"EHOSTUNREACH","machineProvider":"baremetal"}}'
+  printf '1' >"$STUB_DIR/resume.json.rc"
+}
+
+ob_reset
+link_plist "$LINK_ID" 61190
+ob list
+expect_ok "orca-boat list"
+expect_has "...shows Orca's workspaces with status and address" "$OUT" "running 203.0.113.9:19044"
+expect_has "...including one that is asleep" "$OUT" "sleepy"
+expect_has "...and linked sandboxes" "$OUT" "link  $LINK_ID"
+expect_eq "...and changes nothing" "yes" "$(store_unchanged)"
+
+ob_reset
+ob doctor refactor
+expect_ok "doctor passes a working workspace"
+expect_has "...checks the sandbox in its org" "$(cat "$LOG")" "--org Acme info bx_ab12cd34 --json"
+expect_has "...and the address" "$OUT" "ok   address    203.0.113.9:19044"
+expect_has "...and runs its check through boat, not SSH" "$(cat "$LOG")" "exec bx_ab12cd34 script:probe"
+expect_eq "...and changes nothing" "yes|0" "$(store_unchanged)|$(backups)"
+
+ob_reset
+fixture info.json '{"sandbox":{"state":"ready","health":"ok","sshEndpoint":"198.51.100.7:19041"}}'
+ob doctor refactor
+expect_fails "doctor fails when Orca has an old address"
+expect_has "...and shows both" "$OUT" "FAIL address    Orca has 203.0.113.9:19044, boat has 198.51.100.7:19041"
+expect_eq "...changing nothing" "yes|0" "$(store_unchanged)|$(backups)"
+
+ob_reset
+fixture exec-probe.json '{"exitCode":0,"stdout":"unit=none\nlisten=no\nstale=2\n"}'
+ob doctor refactor
+expect_fails "doctor fails on stale orcad locks"
+expect_has "...and counts them" "$OUT" "2 stale orcad lock(s)"
+
+ob_reset
+fixture info-bx_ab12cd34.json '{"sandbox":{"state":"stopped","health":"ok"}}'
+ob doctor refactor
+expect_fails "doctor fails when boat stopped a workspace Orca shows as running"
+expect_has "...and says so" "$OUT" "stopped, but Orca shows 'refactor' as running"
+ob doctor sleepy
+expect_ok "doctor passes a workspace that is asleep in both"
+
+ob_reset
+fixture info.json '{"sandbox":{"state":"ready","health":"ok","sshEndpoint":"198.51.100.7:19041"}}'
+ob fix refactor
+expect_ok "fix repairs an old address"
+expect_eq "...by marking the workspace for a wake" "resume_failed" "$(status_of orca-1)"
+expect_eq "...on the same sandbox" "bx_ab12cd34" "$(resourceid_of orca-1)"
+expect_eq "...after a backup" "1" "$(backups)"
+expect_eq "...leaving the other workspace alone" "$(others_of orca-1 "$TMP/store-before")" "$(others_of orca-1 "$STORE")"
+expect_has "...says what to click" "$OUT" "Now click 'refactor' in Orca's sidebar"
+expect_has "...and shows a notification" "$(cat "$STUB_DIR/notify.log" 2>/dev/null)" "Click 'refactor'"
+expect_lacks "...without waking a sandbox that is up" "$(cat "$LOG")" "resume bx_"
+
+ob_reset
+fixture info.json.1 '{"sandbox":{"state":"idle","health":"error","healthReason":"EHOSTUNREACH","machineProvider":"baremetal"}}'
+fixture info.json.2 '{"sandbox":{"state":"idle","health":"error","healthReason":"EHOSTUNREACH","machineProvider":"baremetal"}}'
+fixture info.json '{"sandbox":{"state":"idle","health":"ok","machineProvider":"baremetal","sshEndpoint":"203.0.113.9:19044"}}'
+ob fix refactor
+expect_ok "fix brings back an unreachable sandbox with resume"
+expect_has "...in its org" "$(cat "$LOG")" "--org Acme resume bx_ab12cd34 --no-auto-stop --json"
+expect_lacks "...skipping boat recover on bare metal" "$(cat "$LOG")" "recover bx_"
+expect_has "...moves stale orcad locks" "$(cat "$LOG")" "exec bx_ab12cd34 script:locks"
+expect_eq "...and marks the workspace for a wake" "resume_failed" "$(status_of orca-1)"
+
+ob_reset
+broken_sandbox
+ob --safe fix refactor
+expect_fails "fix --safe gives up before anything that loses disk changes"
+expect_has "...after a normal stop" "$(cat "$LOG")" "--org Acme stop bx_ab12cd34 --json"
+expect_lacks "...with no forced stop" "$(cat "$LOG")" "--force"
+expect_lacks "...nor fork" "$(cat "$LOG")" "fork"
+expect_has "...and says how to allow them" "$ERR" "run without --safe"
+expect_eq "...changing nothing" "yes|0" "$(store_unchanged)|$(backups)"
+
+ob_reset
+broken_sandbox
+user_cfg '{"defaults":{"recovery":"off"}}'
+ob fix refactor
+expect_fails "fix with recovery off in the user file stops there too"
+expect_lacks "...with no forced stop" "$(cat "$LOG")" "--force"
+
+ob_reset
+broken_sandbox
+ob fix refactor
+expect_fails "fix of a workspace with no stored recovery treats it as off, like resume"
+expect_lacks "...with no forced stop" "$(cat "$LOG")" "--force"
+
+ob_reset
+broken_sandbox
+jq -c '.runtimes[0].recipeResult.userData.recovery = "snapshot"' "$STORE" >"$STORE.tmp" && mv "$STORE.tmp" "$STORE"
+chmod 600 "$STORE"
+fixture fork.json "{\"event\":\"created\",\"sandbox\":{\"id\":\"$FORK_ID\"}}
+{\"event\":\"ready\",\"sandbox\":{\"id\":\"$FORK_ID\"}}"
+fixture "info-$FORK_ID.json" '{"sandbox":{"state":"idle","health":"ok"}}'
+ob fix refactor
+expect_ok "fix forks the latest snapshot when nothing else works"
+expect_eq "...tries a forced stop before it forks" "yes" "$(awk '/ stop bx_ab12cd34 --force/ && !x { x = NR }
+  / fork / && !f { f = NR } END { print (x && f && x < f) ? "yes" : "no" }' "$LOG")"
+expect_has "...forks in the workspace's org" "$(cat "$LOG")" "--org Acme fork --json --no-auto-stop --wait bx_ab12cd34"
+expect_eq "...points the workspace at the fork" "$FORK_ID" "$(resourceid_of orca-1)"
+expect_eq "...marked for a wake" "resume_failed" "$(status_of orca-1)"
+expect_has "...after stopping the fork, so resume finds it asleep" "$(cat "$LOG")" "--org Acme stop $FORK_ID --json"
+expect_has "...keeps the old sandbox and says how to delete it" "$ERR" "boat --org Acme delete bx_ab12cd34"
+expect_lacks "...and deletes nothing" "$(cat "$LOG")" "delete"
+
+ob_reset
+fixture info.json '{"error":"not_found"}'
+printf '1' >"$STUB_DIR/info.json.rc"
+ob fix refactor
+expect_fails "fix refuses a sandbox boat does not know"
+expect_lacks "...forking nothing" "$(cat "$LOG")" "fork"
+expect_eq "...and changing nothing" "yes|0" "$(store_unchanged)|$(backups)"
+
+ob_reset
+fixture info.json '{"sandbox":{"state":"ready","health":"ok","sshEndpoint":"198.51.100.7:19041"}}'
+ob watch run
+expect_ok "watch run with a broken workspace"
+expect_has "...waits for a second look" "$OUT" "fixing it if the next run finds it broken too"
+expect_eq "...changing nothing yet" "yes" "$(store_unchanged)"
+ob watch run
+expect_eq "...and fixes it on the next run" "resume_failed" "$(status_of orca-1)"
+expect_has "...with a notification" "$(cat "$STUB_DIR/notify.log" 2>/dev/null)" "Fixed 'refactor'"
+cp "$STORE" "$TMP/store-fixed"
+ob watch run
+expect_eq "...then leaves it alone" "yes" "$(cmp -s "$STORE" "$TMP/store-fixed" && echo yes || echo no)"
+
+ob_reset
+link_plist "$LINK_ID" 61190
+linked_env
+printf '%s\n' "$LINK_LABEL" >"$STUB_DIR/launchctl-loaded"
+fixture exec-probe.json '{"exitCode":0,"stdout":"unit=active\nlisten=yes\nstale=0\n"}'
+ob doctor "$LINK_ID"
+expect_ok "doctor passes a working linked sandbox"
+expect_has "...with its forward" "$OUT" "ok   forward    127.0.0.1:61190 -> sandbox port 6768"
+expect_has "...its orcad service" "$OUT" "service: active"
+expect_has "...and its pairing" "$OUT" "'boat-bx_9z8y7x6w widgets' is connected"
+fixture exec-probe.json '{"exitCode":0,"stdout":"unit=none\nlisten=yes\nstale=0\n"}'
+ob doctor "$LINK_ID"
+expect_has "doctor warns about an orcad nothing restarts" "$OUT" "Run: orca-boat link $LINK_ID"
+ob doctor "boat-bx_9z8y7x6w widgets"
+expect_ok "doctor finds a linked sandbox by its Orca name"
+
+ob_reset
+link_plist "$LINK_ID" 61190
+fixture exec-probe.json '{"exitCode":0,"stdout":"unit=active\nlisten=yes\nstale=0\n"}'
+fixture exec-pairing.json '{"exitCode":0,"stdout":"code=orca://pair?code=s3cret\n"}'
+fixture orca-env-add.json '{"result":{"environment":{"id":"env-2"}}}'
+ob fix "$LINK_ID"
+expect_ok "fix pairs a linked sandbox Orca lost, and loads its forward"
+expect_has "...loads the forward" "$(cat "$STUB_DIR/launchctl.log")" "bootstrap gui/"
+expect_has "...pairs it under a name with the sandbox's" "$(cat "$STUB_DIR/orca.log")" \
+  "environment add --name boat-bx_9z8y7x6w widgets --pairing-code orca://pair?code=s3cret"
+expect_lacks "...never showing the pairing code" "$OUT$ERR" "s3cret"
+
+ob_reset
+fixture exec-install.json '{"exitCode":0,"stdout":"listen=yes\n"}'
+fixture exec-pairing.json '{"exitCode":0,"stdout":"code=orca://pair?code=s3cret\n"}'
+fixture orca-env-add.json '{"result":{"environment":{"id":"env-2"}}}'
+ob link --local 61191 "$LINK_ID"
+expect_ok "link sets up a sandbox"
+expect_has "...installs the orcad service" "$(cat "$STUB_DIR/exec-scripts.log")" "orca-boat-orcad.service"
+expect_has "...which restarts orcad" "$(cat "$STUB_DIR/exec-scripts.log")" "Restart=always"
+expect_has "...pairing through the local port" "$(cat "$STUB_DIR/exec-scripts.log")" "PAIRING=ws://127.0.0.1:61191"
+expect_has "...writes a forward by sandbox id" "$(tr -d ' \n' <"$AGENTS/$LINK_LABEL.plist")" \
+  "<string>forward</string><string>$LINK_ID</string><string>--remote</string><string>6768</string><string>--local</string><string>61191</string>"
+expect_eq "...kept private" "$AGENTS/$LINK_LABEL.plist" "$(find "$AGENTS/$LINK_LABEL.plist" -perm 0600)"
+expect_has "...loads it" "$(cat "$STUB_DIR/launchctl-loaded")" "$LINK_LABEL"
+expect_has "...pairs it" "$(cat "$STUB_DIR/orca.log")" "environment add --name boat-bx_9z8y7x6w widgets"
+expect_has "...and says it is connected" "$OUT" "is connected"
+ob link bx_nope
+expect_fails "link refuses something that is not a sandbox id"
+
+ob_reset
+ob watch install --interval 600
+expect_ok "watch install"
+expect_has "...runs watch run" "$(tr -d ' \n' <"$AGENTS/dev.codeious.orca.boat-watch.plist")" "<string>watch</string><string>run</string>"
+expect_has "...every 600 seconds" "$(cat "$AGENTS/dev.codeious.orca.boat-watch.plist")" "<integer>600</integer>"
+expect_has "...on the same Orca file" "$(cat "$AGENTS/dev.codeious.orca.boat-watch.plist")" "<string>$STORE</string>"
+expect_has "...and loads it" "$(cat "$STUB_DIR/launchctl-loaded")" "dev.codeious.orca.boat-watch"
+ob watch install --interval 30
+expect_fails "watch install refuses an interval under a minute"
+ob watch uninstall
+expect_ok "watch uninstall"
+expect_eq "...removes the job" "no|" "$([ -f "$AGENTS/dev.codeious.orca.boat-watch.plist" ] && echo yes || echo no)|$(cat "$STUB_DIR/launchctl-loaded")"
 printf '\n%s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]

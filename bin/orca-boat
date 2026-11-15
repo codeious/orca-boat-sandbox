@@ -1,0 +1,991 @@
+#!/usr/bin/env bash
+# Keeps Orca's boat workspaces working when boat breaks a sandbox. It knows two kinds:
+#   ssh    made by this plugin's recipe; Orca connects over SSH to the address resume returned
+#   link   a sandbox paired with Orca as a runtime environment and reached through a launchd
+#          `boat forward` by sandbox id, so a new address does not matter (see `link` below)
+#
+#   orca-boat list                            list both kinds
+#   orca-boat doctor [target...]              check each layer and name the fix; changes nothing
+#   orca-boat fix [--safe] <target>           repair it, trying the steps that keep the disk first
+#   orca-boat link [options] <bx_id>          run orcad as a service on the sandbox, forward it, pair it
+#   orca-boat watch install [--interval SECS] run `watch run` every SECS seconds (default 300)
+#   orca-boat watch uninstall
+#   orca-boat watch run                       doctor every workspace; fix one broken twice in a row
+#
+#   A target is a workspace or environment name, or a sandbox id (bx_...).
+#   --store FILE     Orca's orca-ephemeral-vm-runtimes.json (default: the one in Orca's folder)
+#   --safe           fix: never force-stop or fork, whatever the recovery setting
+#   link options:    --name NAME  --local PORT  --remote PORT (default 6768)  --org ORG
+#
+# fix brings the sandbox up with, in order: boat resume; boat recover (not on bare metal, where boat
+# refuses it); a normal stop and resume. These keep the disk. Then, when recovery is snapshot (the
+# default) and --safe is not given: boat stop --force and resume, then a fork of the latest
+# snapshot. Both lose disk changes made after that snapshot. The old sandbox is never deleted.
+# Then it repairs what sits on top: stale orcad locks, orcad itself, the forward, the pairing, and
+# the address Orca has. link and watch use launchd, so they need macOS.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELF="$HERE/$(basename "${BASH_SOURCE[0]}")"
+# shellcheck disable=SC1091 # the plugin's own library
+. "$HERE/../src/lib.sh"
+
+log() { printf 'orca-boat: %s\n' "$*" >&2; }
+say() { printf '%s\n' "$*"; }
+usage() {
+  sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//' >&2
+  exit 2
+}
+
+AGENTS="${ORCA_BOAT_LAUNCH_AGENTS:-$HOME/Library/LaunchAgents}"
+LOG_DIR="${ORCA_BOAT_LOG_DIR:-$HOME/Library/Logs/OrcaBoatConnections}"
+STATE_DIR="${ORCA_BOAT_STATE_DIR:-$HOME/.local/state/orca-boat}"
+LABEL_PREFIX=dev.codeious.orca.boat.
+WATCH_LABEL=dev.codeious.orca.boat-watch
+POLL="${ORCA_BOAT_POLL:-3}"
+STOP_WAIT="${ORCA_BOAT_STOP_WAIT:-900}"
+RESUME_WAIT="${ORCA_BOAT_RESUME_WAIT:-300}"
+CONNECT_WAIT="${ORCA_BOAT_CONNECT_WAIT:-60}"
+STORE=""
+SAFE=0
+ENV_JSON=""
+TARGETS=""
+PROBLEMS=""
+FORKED=""
+REPAIRED=0
+
+# --- small helpers -------------------------------------------------------------------------------
+
+default_store() {
+  case "$(uname -s)" in
+    Darwin) printf '%s' "$HOME/Library/Application Support/Orca/orca-ephemeral-vm-runtimes.json" ;;
+    *) printf '%s' "${XDG_CONFIG_HOME:-$HOME/.config}/Orca/orca-ephemeral-vm-runtimes.json" ;;
+  esac
+}
+
+dash() { if [ "$1" = - ]; then printf ''; else printf '%s' "$1"; fi; }
+
+# Runs a command for at most SECS seconds. orca and boat can hang on a dead connection.
+with_timeout() { # secs command...
+  local secs="$1" pid watcher rc=0
+  shift
+  "$@" &
+  pid=$!
+  (
+    sleep "$secs" &
+    s=$!
+    # shellcheck disable=SC2064 # s is fixed now
+    trap "kill $s 2>/dev/null; exit 0" TERM
+    wait "$s"
+    kill "$pid" 2>/dev/null
+  ) >/dev/null 2>&1 &
+  watcher=$!
+  wait "$pid" || rc=$?
+  kill "$watcher" 2>/dev/null || true
+  wait "$watcher" 2>/dev/null || true
+  return "$rc"
+}
+
+notify() { # message
+  command -v osascript >/dev/null 2>&1 || return 0
+  osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "Orca boat"' -e 'end run' "$1" \
+    >/dev/null 2>&1 || true
+}
+
+has_problem() { case " $PROBLEMS " in *" $1 "*) return 0 ;; *) return 1 ;; esac }
+add_problem() { has_problem "$1" || PROBLEMS="${PROBLEMS:+$PROBLEMS }$1"; }
+report() { printf '  %-4s %-10s %s\n' "$1" "$2" "$3"; }
+
+# --- Orca --------------------------------------------------------------------------------------------
+
+env_json() {
+  if [ -z "$ENV_JSON" ]; then
+    if command -v orca >/dev/null 2>&1; then
+      ENV_JSON="$(with_timeout 30 orca environment list --json 2>/dev/null || true)"
+    fi
+    printf '%s' "$ENV_JSON" | jq -e '.result.environments | type == "array"' >/dev/null 2>&1 ||
+      ENV_JSON='{"result":{"environments":[]}}'
+  fi
+  printf '%s' "$ENV_JSON"
+}
+
+env_for_port() { # local port -> "id<TAB>name", or nothing
+  env_json | jq -r --arg e "ws://127.0.0.1:$1" '
+    [.result.environments[] | select(any(.endpoints[]?; .endpoint == $e))][0] // empty | "\(.id)\t\(.name)"'
+}
+
+env_connected() { # environment id
+  command -v orca >/dev/null 2>&1 || return 1
+  with_timeout 30 orca status --environment "$1" --json 2>/dev/null |
+    jq -e '.result.runtime.connectionState == "connected"' >/dev/null 2>&1
+}
+
+wait_connected() { # environment id
+  local deadline=$((SECONDS + CONNECT_WAIT))
+  while :; do
+    if env_connected "$1"; then return 0; fi
+    [ "$SECONDS" -lt "$deadline" ] || return 1
+    sleep "$POLL"
+  done
+}
+
+# Changes one record of Orca's runtime file: its status, and with a new id the sandbox it uses.
+store_set() { # runtime_id status [new_sandbox_id]
+  local backup tmp
+  umask 077
+  backup="$STORE.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+  cp -p "$STORE" "$backup"
+  tmp="$(mktemp "$STORE.XXXXXX")"
+  jq --arg id "$1" --arg st "$2" --arg new "${3:-}" --argjson now "$(($(date +%s) * 1000))" '
+    .runtimes |= map(if .id == $id and .status != "cleaned"
+      then .status = $st | .updatedAt = $now
+        | (if $new == "" then . else .recipeResult.userData.resourceId = $new end)
+      else . end)' "$STORE" >"$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$STORE"
+  [ "$(jq -r --arg id "$1" '.runtimes[] | select(.id == $id) | .status' "$STORE")" = "$2" ] ||
+    die "Orca changed $STORE at the same moment; run this again (backup: $backup)"
+  log "updated Orca's record of '$T_NAME'; backup: $backup"
+}
+
+# --- launchd -----------------------------------------------------------------------------------------
+
+gui() { printf 'gui/%s' "$(id -u)"; }
+need_launchd() { command -v launchctl >/dev/null 2>&1 || die "this needs launchd (macOS)"; }
+lc_loaded() { launchctl print "$(gui)/$1" >/dev/null 2>&1; }
+lc_load() { # plist label
+  launchctl bootout "$(gui)/$2" >/dev/null 2>&1 || true
+  launchctl bootstrap "$(gui)" "$1"
+}
+lc_unload() { launchctl bootout "$(gui)/$1" >/dev/null 2>&1 || true; }
+
+# The <string> items of a plist's ProgramArguments, one per line.
+plist_args() {
+  awk '/<key>ProgramArguments<\/key>/ { f = 1; next }
+    f && /<\/array>/ { exit }
+    f && /<string>/ { sub(/.*<string>/, ""); sub(/<\/string>.*/, ""); print }' "$1"
+}
+
+link_fields() { # plist -> L_ID L_LOCAL L_REMOTE L_ORG
+  local prev="" a
+  L_ID="" L_LOCAL="" L_REMOTE="" L_ORG=""
+  while IFS= read -r a; do
+    case "$prev" in
+      --org) L_ORG="$a" ;;
+      forward) L_ID="$a" ;;
+      --remote) L_REMOTE="$a" ;;
+      --local) L_LOCAL="$a" ;;
+    esac
+    prev="$a"
+  done < <(plist_args "$1")
+  if [ -z "$L_REMOTE" ]; then L_REMOTE=6768; fi
+  if [ -z "$L_LOCAL" ]; then L_LOCAL="$L_REMOTE"; fi
+}
+
+xml() { printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
+
+plist_xml() { # label log_file [StartInterval|-] arg...
+  local label="$1" logf="$2" interval="$3" a
+  shift 3
+  cat <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$(xml "$label")</string>
+  <key>ProgramArguments</key>
+  <array>
+PLIST
+  for a in "$@"; do printf '    <string>%s</string>\n' "$(xml "$a")"; done
+  cat <<PLIST
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>$(xml "$HOME")</string>
+    <key>PATH</key>
+    <string>$(xml "$HOME/.ascii/bin:$HOME/.local/bin:${ORCA_DIR:+$ORCA_DIR:}/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")</string>
+  </dict>
+PLIST
+  if [ "$interval" = - ]; then
+    printf '  <key>RunAtLoad</key>\n  <true/>\n  <key>KeepAlive</key>\n  <true/>\n  <key>ThrottleInterval</key>\n  <integer>15</integer>\n'
+  else
+    printf '  <key>RunAtLoad</key>\n  <true/>\n  <key>StartInterval</key>\n  <integer>%s</integer>\n' "$interval"
+  fi
+  cat <<PLIST
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>StandardOutPath</key>
+  <string>$(xml "$logf")</string>
+  <key>StandardErrorPath</key>
+  <string>$(xml "$logf")</string>
+</dict>
+</plist>
+PLIST
+}
+
+write_forward_plist() { # id local remote org -> path
+  local id="$1" plist="$AGENTS/$LABEL_PREFIX$1.plist" boat_bin
+  boat_bin="$(command -v boat)"
+  mkdir -p "$AGENTS" "$LOG_DIR"
+  if [ -n "$4" ]; then
+    plist_xml "$LABEL_PREFIX$id" "$LOG_DIR/$id.log" - "$boat_bin" --no-update --org "$4" forward "$id" \
+      --remote "$3" --local "$2" --bind 127.0.0.1 >"$plist.tmp"
+  else
+    plist_xml "$LABEL_PREFIX$id" "$LOG_DIR/$id.log" - "$boat_bin" --no-update forward "$id" \
+      --remote "$3" --local "$2" --bind 127.0.0.1 >"$plist.tmp"
+  fi
+  chmod 600 "$plist.tmp"
+  mv -f "$plist.tmp" "$plist"
+  printf '%s' "$plist"
+}
+
+port_taken() { # port
+  local plist
+  for plist in "$AGENTS/$LABEL_PREFIX"bx_*.plist; do
+    [ -f "$plist" ] || continue
+    link_fields "$plist"
+    [ "$L_LOCAL" != "$1" ] || return 0
+  done
+  command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+free_port() {
+  local p=61094
+  while [ "$p" -lt 61200 ]; do
+    if ! port_taken "$p"; then
+      printf '%s' "$p"
+      return 0
+    fi
+    p=$((p + 1))
+  done
+  die "no free local port between 61094 and 61199; pass --local PORT"
+}
+
+# --- workspaces ----------------------------------------------------------------------------------
+# One line per workspace, tab-separated, "-" for an empty field:
+# kind id name org orca_status orca_address ref local_port remote_port env_id env_name recovery
+
+all_targets() {
+  local plist env envid envname name
+  if [ -z "$TARGETS" ]; then
+    if [ -f "$STORE" ] && jq -e '.runtimes | type == "array"' "$STORE" >/dev/null 2>&1; then
+      TARGETS="$(jq -r '.runtimes[] | select(.recipeResult.userData.provider == "boat" and .status != "cleaned")
+        | ["ssh", (.recipeResult.userData.resourceId // "-"), (.workspaceName // "-"), (.recipeResult.userData.org // "-"),
+           (.status // "-"), ((.recipeResult.connection.target // {}) | "\(.host // "-"):\(.port // "-")"), .id,
+           "-", "-", "-", "-", (.recipeResult.userData.recovery // "-")]
+        | map(tostring | if . == "" then "-" else gsub("\t"; " ") end) | @tsv' "$STORE")"
+    fi
+    for plist in "$AGENTS/$LABEL_PREFIX"bx_*.plist; do
+      [ -f "$plist" ] || continue
+      link_fields "$plist"
+      [[ "$L_ID" =~ ^bx_[a-z0-9]{8}$ ]] || continue
+      env="$(env_for_port "$L_LOCAL")"
+      envid="${env%%$'\t'*}"
+      envname="${env#*$'\t'}"
+      if [ -z "$env" ]; then
+        envid=-
+        envname=-
+      fi
+      name="$envname"
+      if [ "$name" = - ]; then name="$L_ID"; fi
+      TARGETS="${TARGETS:+$TARGETS
+}$(printf 'link\t%s\t%s\t%s\t-\t127.0.0.1:%s\t%s\t%s\t%s\t%s\t%s\t-' "$L_ID" "$name" "${L_ORG:--}" "$L_LOCAL" \
+        "$plist" "$L_LOCAL" "$L_REMOTE" "$envid" "$envname")"
+    done
+  fi
+  printf '%s' "$TARGETS"
+}
+
+set_target() { # line
+  IFS=$'\t' read -r T_KIND T_ID T_NAME T_ORG T_STATUS T_ADDR T_REF T_LOCAL T_REMOTE T_ENV T_ENVNAME T_REC <<<"$1"
+  T_ORG="$(dash "$T_ORG")"
+  T_ENV="$(dash "$T_ENV")"
+  T_ENVNAME="$(dash "$T_ENVNAME")"
+  T_REC="$(dash "$T_REC")"
+  ORG="$T_ORG"
+}
+
+select_target() { # want
+  local line n=0 match="" id name envid envname
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    IFS=$'\t' read -r _ id name _ _ _ _ _ _ envid envname _ <<<"$line"
+    if [ "$id" = "$1" ] || [ "$name" = "$1" ] || [ "$envname" = "$1" ] || [ "$envid" = "$1" ]; then
+      n=$((n + 1))
+      match="$line"
+    fi
+  done <<<"$(all_targets)"
+  [ "$n" -gt 0 ] || die "no boat workspace '$1'; run: orca-boat list"
+  [ "$n" -eq 1 ] || die "$n workspaces match '$1'; use the sandbox id (bx_...)"
+  set_target "$match"
+}
+
+# What fix may do to this workspace's disk: snapshot allows a forced stop and a fork. The
+# workspace's stored setting wins. Without one: ORCA_BOAT_RECOVERY, then the user file's defaults,
+# then off for a workspace from an older create (as resume does) and snapshot for a linked sandbox.
+target_recovery() {
+  local value="$T_REC"
+  if [ "$SAFE" = 1 ]; then
+    printf 'off'
+    return 0
+  fi
+  if [ -z "$value" ]; then value="${ORCA_BOAT_RECOVERY:-}"; fi
+  if [ -z "$value" ]; then value="$(config_get "$USER_CONFIG" .defaults recovery 2>/dev/null || true)"; fi
+  if [ -z "$value" ] && [ "$T_KIND" = link ]; then value=snapshot; fi
+  case "$value" in snapshot) printf 'snapshot' ;; *) printf 'off' ;; esac
+}
+
+# --- the sandbox ---------------------------------------------------------------------------------
+
+sb_info() { # id -> S_STATE S_HEALTH S_REASON S_PROVIDER S_ENDPOINT S_NAME
+  local info
+  info="$(with_timeout 60 boat_cli info "$1" --json 2>/dev/null || true)"
+  S_STATE="$(printf '%s' "$info" | jq -r '.sandbox.state // empty' 2>/dev/null || true)"
+  S_HEALTH="$(printf '%s' "$info" | jq -r '.sandbox.health // "ok"' 2>/dev/null || echo ok)"
+  S_REASON="$(printf '%s' "$info" | jq -r '.sandbox.healthReason // empty' 2>/dev/null || true)"
+  S_PROVIDER="$(printf '%s' "$info" | jq -r '.sandbox.machineProvider // empty' 2>/dev/null || true)"
+  S_NAME="$(printf '%s' "$info" | jq -r '.sandbox.name // empty' 2>/dev/null || true)"
+  S_ENDPOINT="$(printf '%s' "$info" | jq -r '.sandbox | (.sshEndpoint // (if .ip then "\(.ip):22" else empty end))' \
+    2>/dev/null || true)"
+}
+
+sb_up() { # id
+  sb_info "$1"
+  case "$S_STATE:$S_HEALTH" in ready:ok | idle:ok | running:ok) return 0 ;; *) return 1 ;; esac
+}
+
+wait_up() { # id secs
+  local deadline=$((SECONDS + $2))
+  while :; do
+    if sb_up "$1"; then return 0; fi
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      log "timed out after ${2}s waiting for $1 (last: ${S_STATE:-unknown}, health ${S_HEALTH:-unknown})"
+      return 1
+    fi
+    sleep "$POLL"
+  done
+}
+
+wait_stopped() { # id secs
+  local deadline=$((SECONDS + $2))
+  while :; do
+    sb_info "$1"
+    case "$S_STATE" in stopped | archived) return 0 ;; esac
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      log "timed out after ${2}s waiting for $1 to stop (last: ${S_STATE:-unknown})"
+      return 1
+    fi
+    sleep "$POLL"
+  done
+}
+
+resume_up() { # id secs
+  boat_quiet resume "$1" --no-auto-stop --json && wait_up "$1" "$2"
+}
+
+stop_up() { # id [--force]
+  boat_quiet stop "$1" ${2:+"$2"} --json && wait_stopped "$1" "$STOP_WAIT" && resume_up "$1" "$RESUME_WAIT"
+}
+
+# Brings the sandbox up. Sets FORKED to the fork's id when only a fork helped.
+bring_up() { # id
+  local id="$1"
+  FORKED=""
+  if sb_up "$id"; then return 0; fi
+  REPAIRED=1
+  log "$id is ${S_STATE:-unknown} (health ${S_HEALTH:-unknown}); resuming it"
+  if resume_up "$id" "$RESUME_WAIT"; then return 0; fi
+  if [ "$S_PROVIDER" = baremetal ]; then
+    log "$id is on a bare-metal machine, which boat cannot power-cycle; skipping boat recover"
+  else
+    log "power-cycling $id with boat recover; its disk is not touched"
+    if boat_quiet recover "$id" --json && resume_up "$id" 180; then return 0; fi
+  fi
+  log "stopping $id and starting it again; a normal stop keeps its disk"
+  if stop_up "$id"; then return 0; fi
+  if [ "$(target_recovery)" != snapshot ]; then
+    log "$id is still down. The steps left (a forced stop, a fork) lose disk changes made after its latest snapshot; run without --safe, or set recovery to snapshot, to allow them"
+    return 1
+  fi
+  log "force-stopping $id. Changes on its disk made after its latest snapshot are lost"
+  if stop_up "$id" --force; then return 0; fi
+  log "forking the latest snapshot of $id. Changes on its disk made after that snapshot are not on the fork"
+  fork_sandbox "$id" || {
+    log "could not fork $id"
+    return 1
+  }
+  [[ "$SANDBOX_ID" =~ ^bx_[a-z0-9]{8}$ ]] && [ "$SANDBOX_ID" != "$id" ] || {
+    log "boat did not report the fork's id"
+    return 1
+  }
+  FORKED="$SANDBOX_ID"
+  log "forked $id into $FORKED. $id is kept; once nothing in it is needed: boat${ORG:+ --org $ORG} delete $id"
+  wait_up "$FORKED" "$RESUME_WAIT" || return 1
+}
+
+# Runs a script on the sandbox over the boat API, so no SSH address or host key is needed.
+# The marker names the script for the test double. Sets RUN_OUT to its stdout.
+sandbox_run() { # id marker script
+  local out rc
+  out="$(with_timeout 180 boat_cli exec "$1" --json --timeout 150 -- bash -c "# orca-boat:$2
+$3" 2>/dev/null || true)"
+  RUN_OUT="$(printf '%s' "$out" | jq -r '.stdout // empty' 2>/dev/null || true)"
+  rc="$(printf '%s' "$out" | jq -r '.exitCode // 1' 2>/dev/null || echo 1)"
+  case "$rc" in '' | *[!0-9]*) rc=1 ;; esac
+  return "$rc"
+}
+
+kv() { printf '%s\n' "$RUN_OUT" | sed -n "s/^$1=//p" | tail -n 1; }
+
+probe_script() { # remote port, or ""
+  emit_exports "PORT=$1"
+  orcad_repair_script
+  cat <<'PROBE'
+unit=none
+if systemctl --user cat orca-boat-orcad.service >/dev/null 2>&1; then
+  unit="$(systemctl --user is-active orca-boat-orcad.service 2>/dev/null || true)"
+fi
+listen=no
+if [ -n "$PORT" ] && ss -ltn 2>/dev/null | awk '{ print $4 }' | grep -qE "[:.]$PORT\$"; then listen=yes; fi
+stale=0
+for lock in "$HOME"/.orca/orcad.lock "$HOME"/.orca-*/orcad.lock; do
+  [ -f "$lock" ] || continue
+  orcad_lock_live "$lock" || stale=$((stale + 1))
+done
+echo "unit=${unit:-unknown}"
+echo "listen=$listen"
+echo "stale=$stale"
+PROBE
+}
+
+locks_script() {
+  orcad_repair_script
+  # shellcheck disable=SC2016 # expands on the sandbox
+  echo 'echo "moved=$(repair_orcad_locks)"'
+}
+
+# The start script the service runs: move stale locks, then start the orcad Orca installed last.
+wrapper_body() {
+  printf '#!/bin/bash\n# Starts Orca'"'"'s server for orca-boat-orcad.service. Written by the Boat.dev sandbox plugin.\nset -euo pipefail\n'
+  orcad_repair_script
+  cat <<'WRAPPER'
+repair_orcad_locks >/dev/null
+remote="$HOME/.orca-remote"
+active="$(sed -n 's/.*"active"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$remote/orcad-active.json" 2>/dev/null | head -n 1)"
+entry="$remote/orcad-$active/orcad.js"
+if [ -z "$active" ] || [ ! -f "$entry" ]; then entry="$(ls -1t "$remote"/orcad-*/orcad.js 2>/dev/null | head -n 1)"; fi
+[ -f "$entry" ] || { echo "no orcad.js under $remote; Orca has not installed its server on this sandbox" >&2; exit 1; }
+node="$(ls -1t "$remote"/runtimes/node-*/bin/node 2>/dev/null | head -n 1)"
+if [ ! -x "$node" ]; then node="$(command -v node)"; fi
+exec "$node" "$entry" --port "${ORCAD_PORT:?}" --bind 127.0.0.1 --pairing-address "${ORCAD_PAIRING_ADDRESS:?}" --json
+WRAPPER
+}
+
+unit_body() {
+  cat <<'UNIT'
+[Unit]
+Description=Orca server (orcad), kept running by the Boat.dev sandbox plugin
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/orca-boat/orcad.env
+ExecStart=%h/.local/bin/orca-boat-orcad
+Restart=always
+RestartSec=5
+UMask=0077
+StandardOutput=append:%h/.local/state/orca-boat/orcad.log
+StandardError=append:%h/.local/state/orca-boat/orcad.err.log
+
+[Install]
+WantedBy=default.target
+UNIT
+}
+
+# Installs and starts the service. A server started by hand on the same port is stopped first: it
+# holds the port and the lock. The terminal daemon is a separate process and keeps running.
+install_script() { # remote_port pairing_address
+  emit_exports "PORT=$1" "PAIRING=$2" "WRAPPER=$(wrapper_body)" "UNIT=$(unit_body)"
+  cat <<'INSTALL'
+set -euo pipefail
+umask 077
+mkdir -p "$HOME/.local/bin" "$HOME/.local/state/orca-boat" "$HOME/.config/orca-boat" "$HOME/.config/systemd/user"
+printf '%s\n' "$WRAPPER" >"$HOME/.local/bin/orca-boat-orcad.tmp"
+chmod 700 "$HOME/.local/bin/orca-boat-orcad.tmp"
+mv -f "$HOME/.local/bin/orca-boat-orcad.tmp" "$HOME/.local/bin/orca-boat-orcad"
+printf 'ORCAD_PORT=%s\nORCAD_PAIRING_ADDRESS=%s\n' "$PORT" "$PAIRING" >"$HOME/.config/orca-boat/orcad.env"
+printf '%s\n' "$UNIT" >"$HOME/.config/systemd/user/orca-boat-orcad.service"
+me="$(id -un)"
+if ! loginctl show-user "$me" -p Linger 2>/dev/null | grep -q '=yes'; then
+  sudo -n loginctl enable-linger "$me" </dev/null || echo "warning: could not turn on lingering; orcad starts only once a session opens" >&2
+fi
+systemctl --user daemon-reload
+systemctl --user enable orca-boat-orcad.service >/dev/null 2>&1
+main="$(systemctl --user show -p MainPID --value orca-boat-orcad.service 2>/dev/null || echo 0)"
+hand="$(ps -u "$(id -u)" -o pid=,args= | awk -v p="--port $PORT " -v me="$$" -v main="$main" \
+  'index($0, "orcad.js") && index($0 " ", p) && $1 != me && $1 != main { print $1 }')"
+if [ -n "$hand" ]; then
+  echo "stopping the orcad started by hand on port $PORT" >&2
+  # shellcheck disable=SC2086 # one word per pid
+  kill $hand 2>/dev/null || true
+  sleep 3
+fi
+systemctl --user restart orca-boat-orcad.service
+for _ in $(seq 1 30); do
+  if ss -ltn 2>/dev/null | awk '{ print $4 }' | grep -qE "[:.]$PORT\$"; then echo listen=yes; exit 0; fi
+  sleep 2
+done
+echo listen=no
+systemctl --user status orca-boat-orcad.service --no-pager 2>&1 | tail -n 5 >&2
+exit 1
+INSTALL
+}
+
+restart_script() { # remote port
+  emit_exports "PORT=$1"
+  cat <<'RESTART'
+systemctl --user restart orca-boat-orcad.service || exit 1
+for _ in $(seq 1 30); do
+  if ss -ltn 2>/dev/null | awk '{ print $4 }' | grep -qE "[:.]$PORT\$"; then echo listen=yes; exit 0; fi
+  sleep 2
+done
+echo listen=no
+exit 1
+RESTART
+}
+
+# Prints the pairing code from the newest start of orcad: the service's log, else boat's logs of a
+# server started with `boat exec --detach`. The code is a secret; it is never logged.
+pairing_script() {
+  cat <<'PAIRING'
+code=""
+for f in "$HOME/.local/state/orca-boat/orcad.log" $(ls -1t "$HOME"/.ascii/processes/*.log 2>/dev/null); do
+  [ -f "$f" ] || continue
+  code="$(grep '"orca_server_ready"' "$f" 2>/dev/null | tail -n 1 |
+    sed -n 's/.*"pairing":{[^}]*"url":"\(orca:\/\/pair?code=[^"]*\)".*/\1/p')"
+  [ -z "$code" ] || break
+done
+[ -n "$code" ] || exit 1
+echo "code=$code"
+PAIRING
+}
+
+pair_env() { # id remote_port name old_env_id
+  local code out new
+  sandbox_run "$1" pairing "$(pairing_script)" || {
+    log "orcad on $1 has not printed a pairing code"
+    return 1
+  }
+  code="$(kv code)"
+  case "$code" in orca://pair\?code=?*) ;; *)
+    log "orcad on $1 printed no usable pairing code"
+    return 1
+    ;;
+  esac
+  if [ -n "$4" ] && [ "$(env_json | jq -r --arg id "$4" '.result.environments[] | select(.id == $id) | .name')" = "$3" ]; then
+    with_timeout 30 orca environment rm --environment "$4" --json >/dev/null 2>&1 || true
+  fi
+  out="$(with_timeout 60 orca environment add --name "$3" --pairing-code "$code" --json 2>/dev/null || true)"
+  new="$(printf '%s' "$out" | jq -r '.result.environment.id // .result.id // empty' 2>/dev/null || true)"
+  [ -n "$new" ] || {
+    log "orca environment add failed: $(printf '%s' "$out" | jq -r '.error.message // "no answer"' 2>/dev/null)"
+    return 1
+  }
+  ENV_JSON=""
+  log "paired $1 with Orca as '$3'"
+  if [ -n "$4" ] && [ "$4" != "$new" ] && env_json | jq -e --arg id "$4" 'any(.result.environments[]; .id == $id)' >/dev/null; then
+    if wait_connected "$new"; then
+      with_timeout 30 orca environment rm --environment "$4" --json >/dev/null 2>&1 || true
+      log "removed the environment that pointed at the old sandbox"
+    fi
+  fi
+  T_ENV="$new"
+  T_ENVNAME="$3"
+}
+
+# --- doctor --------------------------------------------------------------------------------------
+
+doctor_target() {
+  PROBLEMS=""
+  say "$T_NAME ($T_ID, $T_KIND)"
+  sb_info "$T_ID"
+  if [ -z "$S_STATE" ]; then
+    report FAIL sandbox "boat does not know $T_ID: deleted, in another org, or boat is unreachable"
+    add_problem gone
+    return 0
+  fi
+  case "$S_STATE:$S_HEALTH" in
+    ready:ok | idle:ok | running:ok) report ok sandbox "$S_STATE, health ok${S_PROVIDER:+, $S_PROVIDER}" ;;
+    stopped:ok | archived:ok)
+      if [ "$T_KIND" = link ]; then
+        report ok sandbox "stopped; run: orca-boat fix $T_ID to start it"
+      elif [ "$T_STATUS" = running ]; then
+        report FAIL sandbox "stopped, but Orca shows '$T_NAME' as running and keeps retrying"
+        add_problem asleep
+      else
+        report ok sandbox "stopped; Orca shows it as $T_STATUS and wakes it when you click it"
+      fi
+      return 0
+      ;;
+    *)
+      report FAIL sandbox "$S_STATE, health $S_HEALTH${S_REASON:+ ($S_REASON)}"
+      add_problem sandbox
+      return 0
+      ;;
+  esac
+
+  if [ "$T_KIND" = ssh ]; then
+    case "$T_STATUS" in
+      running)
+        if [ -n "$S_ENDPOINT" ] && [ "$S_ENDPOINT" != "$T_ADDR" ]; then
+          report FAIL address "Orca has $T_ADDR, boat has $S_ENDPOINT"
+          add_problem address
+        else
+          report ok address "$T_ADDR"
+        fi
+        ;;
+      resume_failed) report WARN orca "Orca will wake '$T_NAME' when you click it in the sidebar" ;;
+      *) report WARN orca "Orca shows '$T_NAME' as $T_STATUS" ;;
+    esac
+    if sandbox_run "$T_ID" probe "$(probe_script "")"; then
+      if [ "$(kv stale)" != 0 ]; then
+        report FAIL orcad "$(kv stale) stale orcad lock(s); the next server will not start"
+        add_problem locks
+      fi
+    else
+      report WARN orcad "could not run a check on the sandbox"
+    fi
+    return 0
+  fi
+
+  if command -v launchctl >/dev/null 2>&1 && lc_loaded "$LABEL_PREFIX$T_ID"; then
+    report ok forward "127.0.0.1:$T_LOCAL -> sandbox port $T_REMOTE"
+  else
+    report FAIL forward "launchd job $LABEL_PREFIX$T_ID is not loaded"
+    add_problem forward
+  fi
+  if sandbox_run "$T_ID" probe "$(probe_script "$T_REMOTE")"; then
+    if [ "$(kv listen)" = yes ]; then
+      if [ "$(kv unit)" = none ]; then
+        report WARN orcad "listening on $T_REMOTE, but started by hand: nothing restarts it. Run: orca-boat link $T_ID"
+      else
+        report ok orcad "listening on $T_REMOTE (service: $(kv unit))"
+      fi
+    else
+      report FAIL orcad "nothing listens on port $T_REMOTE (service: $(kv unit), stale locks: $(kv stale))"
+      add_problem orcad
+    fi
+  else
+    report FAIL orcad "could not run a check on the sandbox"
+    add_problem orcad
+  fi
+  if [ -z "$T_ENV" ]; then
+    report FAIL pairing "no Orca environment uses ws://127.0.0.1:$T_LOCAL"
+    add_problem pairing
+  elif env_connected "$T_ENV"; then
+    report ok pairing "'$T_ENVNAME' is connected"
+  else
+    report FAIL pairing "'$T_ENVNAME' is not connected"
+    add_problem connection
+  fi
+}
+
+cmd_list() {
+  local line k id name st addr
+  printf '%-5s %-12s %-40s %s\n' KIND SANDBOX NAME 'ORCA STATUS / ADDRESS'
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    IFS=$'\t' read -r k id name _ st addr _ <<<"$line"
+    if [ "$k" = ssh ]; then
+      printf '%-5s %-12s %-40s %s %s\n' "$k" "$id" "$name" "$st" "$addr"
+    else
+      printf '%-5s %-12s %-40s %s\n' "$k" "$id" "$name" "$addr"
+    fi
+  done <<<"$(all_targets)"
+}
+
+cmd_doctor() {
+  local want line failed=0
+  if [ $# -eq 0 ]; then
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      set_target "$line"
+      doctor_target
+      [ -z "$PROBLEMS" ] || failed=1
+    done <<<"$(all_targets)"
+  else
+    for want in "$@"; do
+      select_target "$want"
+      doctor_target
+      [ -z "$PROBLEMS" ] || failed=1
+    done
+  fi
+  return "$failed"
+}
+
+# --- fix -----------------------------------------------------------------------------------------
+
+fix_ssh() {
+  local mark=0
+  if [ -n "$FORKED" ]; then
+    # Orca's resume expects a stopped sandbox; it then pins the fork's host key and machine ID.
+    boat_quiet stop "$FORKED" --json || log "warning: could not stop $FORKED; Orca's wake uses it as it is"
+    store_set "$T_REF" resume_failed "$FORKED"
+    T_ID="$FORKED"
+    say "moved '$T_NAME' to the fork $FORKED"
+  else
+    if has_problem locks || [ "$REPAIRED" = 1 ]; then
+      if sandbox_run "$T_ID" locks "$(locks_script)" && [ "$(kv moved)" != 0 ]; then
+        say "moved $(kv moved) stale orcad lock(s) to ~/.orca-recovery on the sandbox"
+      fi
+    fi
+    if [ "$T_STATUS" = running ] && { has_problem address || has_problem asleep || [ "$REPAIRED" = 1 ]; }; then mark=1; fi
+    if [ "$mark" = 1 ]; then store_set "$T_REF" resume_failed; fi
+  fi
+  if [ "$mark" = 1 ] || [ -n "$FORKED" ]; then
+    T_STATUS=resume_failed
+    say "Now click '$T_NAME' in Orca's sidebar: Orca runs resume, which returns the new address."
+    notify "Click '$T_NAME' in Orca's sidebar to reconnect it."
+  fi
+}
+
+ensure_orcad() { # id
+  local pairing="ws://127.0.0.1:$T_LOCAL"
+  sandbox_run "$1" probe "$(probe_script "$T_REMOTE")" || true
+  if [ "$(kv unit)" = none ] || [ -z "$(kv unit)" ]; then
+    if [ "$(kv listen)" = yes ] && [ "$REPAIRED" = 0 ] && [ -z "$FORKED" ]; then return 0; fi
+    log "installing orca-boat-orcad.service on $1"
+    sandbox_run "$1" install "$(install_script "$T_REMOTE" "$pairing")" || {
+      log "orcad did not come up on $1"
+      return 1
+    }
+  elif [ "$(kv listen)" != yes ]; then
+    log "restarting orca-boat-orcad.service on $1"
+    sandbox_run "$1" restart "$(restart_script "$T_REMOTE")" || {
+      log "orcad did not come up on $1"
+      return 1
+    }
+  fi
+}
+
+fix_link() {
+  local old="$T_ID" plist name
+  need_launchd
+  if [ -n "$FORKED" ]; then
+    lc_unload "$LABEL_PREFIX$old"
+    mkdir -p "$STATE_DIR/old-plists"
+    if [ -f "$T_REF" ]; then mv -f "$T_REF" "$STATE_DIR/old-plists/$(basename "$T_REF").$(date +%s)"; fi
+    T_ID="$FORKED"
+    plist="$(write_forward_plist "$T_ID" "$T_LOCAL" "$T_REMOTE" "$ORG")"
+    T_REF="$plist"
+    lc_load "$plist" "$LABEL_PREFIX$T_ID"
+    say "moved the forward to the fork $T_ID (old job kept in $STATE_DIR/old-plists)"
+  fi
+  sandbox_run "$T_ID" locks "$(locks_script)" || true
+  ensure_orcad "$T_ID" || return 1
+  if [ -f "$T_REF" ] && ! lc_loaded "$LABEL_PREFIX$T_ID"; then
+    lc_load "$T_REF" "$LABEL_PREFIX$T_ID"
+  elif [ "$REPAIRED" = 1 ] || has_problem forward || has_problem orcad || has_problem connection; then
+    launchctl kickstart -k "$(gui)/$LABEL_PREFIX$T_ID" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$T_ENV" ] && [ -z "$FORKED" ] && wait_connected "$T_ENV"; then return 0; fi
+  name="$T_ENVNAME"
+  if [ -n "$name" ] && [ -n "$FORKED" ]; then name="${name//$old/$T_ID}"; fi
+  if [ -z "$name" ]; then name="boat-$T_ID${S_NAME:+ $S_NAME}"; fi
+  pair_env "$T_ID" "$T_REMOTE" "$name" "$T_ENV"
+}
+
+fix_target() {
+  doctor_target
+  if [ -z "$PROBLEMS" ]; then
+    say "nothing to fix"
+    return 0
+  fi
+  has_problem gone && die "boat does not know $T_ID; there is nothing to recover it from. Check: boat list"
+  REPAIRED=0
+  FORKED=""
+  if has_problem sandbox || { [ "$T_KIND" = link ] && has_problem orcad; } || has_problem connection; then
+    bring_up "$T_ID" || return 1
+  fi
+  if [ "$T_KIND" = ssh ]; then fix_ssh; else fix_link || return 1; fi
+  ENV_JSON=""
+  say "--- after the fix"
+  doctor_target
+  [ -z "$PROBLEMS" ]
+}
+
+cmd_fix() {
+  [ $# -eq 1 ] || usage
+  select_target "$1"
+  fix_target
+}
+
+# --- link ----------------------------------------------------------------------------------------
+
+cmd_link() {
+  local id="" name="" lport="" rport="" plist line
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) name="${2:?--name needs a value}"; shift ;;
+      --local) lport="${2:?--local needs a port}"; shift ;;
+      --remote) rport="${2:?--remote needs a port}"; shift ;;
+      --org) ORG="${2:?--org needs a value}"; shift ;;
+      -*) usage ;;
+      *) [ -z "$id" ] || usage; id="$1" ;;
+    esac
+    shift
+  done
+  [[ "$id" =~ ^bx_[a-z0-9]{8}$ ]] || die "link needs a sandbox id (bx_...)"
+  for p in "$lport" "$rport"; do case "$p" in *[!0-9]*) die "a port is a number" ;; esac; done
+  require_match org "$ORG" "--org" "$ORG_RE" "use an organization name or id from: boat org list"
+  need_launchd
+  plist="$AGENTS/$LABEL_PREFIX$id.plist"
+  if [ -f "$plist" ]; then
+    link_fields "$plist"
+    lport="${lport:-$L_LOCAL}"
+    rport="${rport:-$L_REMOTE}"
+    ORG="${ORG:-$L_ORG}"
+  fi
+  rport="${rport:-6768}"
+  lport="${lport:-$(free_port)}"
+  T_KIND=link T_ID="$id" T_NAME="$id" T_STATUS=- T_REF="$plist" T_LOCAL="$lport" T_REMOTE="$rport" T_REC=""
+  line="$(env_for_port "$lport")"
+  T_ENV="${line%%$'\t'*}"
+  T_ENVNAME="${line#*$'\t'}"
+  if [ -z "$line" ]; then T_ENV="" T_ENVNAME=""; fi
+  if [ -n "$name" ]; then T_ENVNAME="$name"; fi
+
+  REPAIRED=0
+  bring_up "$id" || die "$id is not up"
+  if [ -n "$FORKED" ]; then die "$id only came up as the fork $FORKED; run: orca-boat link $FORKED"; fi
+  sb_info "$id"
+  log "installing orca-boat-orcad.service on $id (port $rport, paired through 127.0.0.1:$lport)"
+  sandbox_run "$id" install "$(install_script "$rport" "ws://127.0.0.1:$lport")" || die "orcad did not come up on $id"
+  plist="$(write_forward_plist "$id" "$lport" "$rport" "$ORG")"
+  lc_load "$plist" "$LABEL_PREFIX$id"
+  say "forwarding 127.0.0.1:$lport to port $rport on $id (launchd job $LABEL_PREFIX$id)"
+  if [ -n "$T_ENV" ] && [ -z "$name" ] && wait_connected "$T_ENV"; then
+    say "'$T_ENVNAME' is connected"
+    return 0
+  fi
+  pair_env "$id" "$rport" "${T_ENVNAME:-boat-$id${S_NAME:+ $S_NAME}}" "$T_ENV" || die "pairing failed"
+  if wait_connected "$T_ENV"; then say "'$T_ENVNAME' is connected"; else die "'$T_ENVNAME' did not connect"; fi
+}
+
+# --- watch ---------------------------------------------------------------------------------------
+
+cmd_watch() {
+  local sub="${1:-}" interval=300 plist="$AGENTS/$WATCH_LABEL.plist"
+  shift || true
+  case "$sub" in
+    install)
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --interval) interval="${2:?--interval needs seconds}"; shift ;;
+          *) usage ;;
+        esac
+        shift
+      done
+      case "$interval" in '' | *[!0-9]*) die "--interval is a number of seconds" ;; esac
+      [ "$interval" -ge 60 ] || die "--interval must be at least 60 seconds"
+      need_launchd
+      ORCA_DIR="$(dirname "$(command -v orca 2>/dev/null || echo /usr/local/bin/orca)")"
+      mkdir -p "$AGENTS" "$LOG_DIR"
+      plist_xml "$WATCH_LABEL" "$LOG_DIR/watch.log" "$interval" /bin/bash "$SELF" --store "$STORE" watch run >"$plist.tmp"
+      chmod 600 "$plist.tmp"
+      mv -f "$plist.tmp" "$plist"
+      lc_load "$plist" "$WATCH_LABEL"
+      say "watching every ${interval}s (launchd job $WATCH_LABEL, log $LOG_DIR/watch.log)"
+      ;;
+    uninstall)
+      need_launchd
+      lc_unload "$WATCH_LABEL"
+      rm -f "$plist"
+      say "stopped watching"
+      ;;
+    run) watch_run ;;
+    *) usage ;;
+  esac
+}
+
+# A workspace is fixed only when two runs in a row find it broken, so a sandbox boat is busy
+# restarting is left alone, and at most once in 20 minutes.
+watch_run() {
+  local line lock="$STATE_DIR/watch.lock" seen last out
+  mkdir -p "$STATE_DIR"
+  if [ -d "$lock" ] && [ -n "$(find "$lock" -maxdepth 0 -mmin +180 2>/dev/null)" ]; then rmdir "$lock" 2>/dev/null || true; fi
+  mkdir "$lock" 2>/dev/null || {
+    log "another watch run is still going"
+    return 0
+  }
+  # shellcheck disable=SC2064 # the path is fixed now
+  trap "rmdir '$lock' 2>/dev/null || true" EXIT
+  out="$(mktemp "${TMPDIR:-/tmp}/orca-boat-watch.XXXXXX")"
+  say "--- watch run $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    set_target "$line"
+    seen="$STATE_DIR/watch-$T_ID.seen"
+    last="$STATE_DIR/watch-$T_ID.fixed"
+    doctor_target >"$out" 2>&1 || true
+    if [ -z "$PROBLEMS" ] || has_problem gone; then
+      rm -f "$seen"
+      continue
+    fi
+    cat "$out"
+    if [ ! -f "$seen" ]; then
+      printf '%s\n' "$PROBLEMS" >"$seen"
+      say "$T_NAME: broken ($PROBLEMS); fixing it if the next run finds it broken too"
+      continue
+    fi
+    if [ -f "$last" ] && [ -n "$(find "$last" -mmin -20 2>/dev/null)" ]; then
+      say "$T_NAME: fixed less than 20 minutes ago; waiting"
+      continue
+    fi
+    touch "$last"
+    if (fix_target) >"$out" 2>&1; then
+      rm -f "$seen"
+      cat "$out"
+      notify "Fixed '$T_NAME' ($T_ID)."
+    else
+      cat "$out"
+      notify "Could not fix '$T_NAME' ($T_ID). See $LOG_DIR/watch.log"
+    fi
+    TARGETS=""
+    ENV_JSON=""
+  done <<<"$(all_targets)"
+  rm -f "$out"
+}
+
+# --- main ----------------------------------------------------------------------------------------
+
+args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --store)
+      STORE="${2:?--store needs a file}"
+      shift
+      ;;
+    --safe) SAFE=1 ;;
+    -h | --help) usage ;;
+    *) args+=("$1") ;;
+  esac
+  shift
+done
+[ "${#args[@]}" -gt 0 ] || usage
+[ -n "$STORE" ] || STORE="$(default_store)"
+require_tools boat jq
+cmd="${args[0]}"
+rest=("${args[@]:1}")
+case "$cmd" in
+  list) cmd_list ;;
+  doctor) cmd_doctor ${rest[@]+"${rest[@]}"} ;;
+  fix) cmd_fix ${rest[@]+"${rest[@]}"} ;;
+  link) cmd_link ${rest[@]+"${rest[@]}"} ;;
+  watch) cmd_watch ${rest[@]+"${rest[@]}"} ;;
+  *) usage ;;
+esac

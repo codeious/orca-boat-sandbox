@@ -39,8 +39,8 @@
     },
     "recovery": {
       "enum": ["off", "snapshot"],
-      "default": "off",
-      "description": "What waking a sandbox boat cannot resume does. snapshot: power-cycle it, and if that fails fork the workspace's latest disk snapshot into a new sandbox, losing disk changes made after that snapshot. The old sandbox is kept. Read when the workspace is created, so it does not apply to older workspaces."
+      "default": "snapshot",
+      "description": "What waking a sandbox boat cannot resume may do after a power cycle and a normal stop fail. snapshot: force-stop it, then fork the workspace's latest disk snapshot into a new sandbox; both lose disk changes made after that snapshot. off: stop there. The old sandbox is kept. Stored with the workspace when it is created."
     }
   }
 }

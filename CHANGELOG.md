@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.0
+
+- `recovery` is `snapshot` by default. Create stores it with the workspace, `off` included, so a later change of the default does not change an existing workspace. A workspace with nothing stored (created by 1.0.4 or earlier without the setting) uses `ORCA_BOAT_RECOVERY`, else `defaults.recovery` in your config file, else `off`.
+- Resume tries more before it gives up on a sandbox boat cannot resume: `boat recover` (skipped on bare metal, where boat refuses it), then a normal stop and resume, which keeps the disk. With `recovery: snapshot` it then tries a forced stop and resume, and only then a fork of the latest snapshot. Resume also moves stale Orca server locks on the sandbox to `~/.orca-recovery`, so Orca's server can start after a restart.
+- Adds `bin/orca-boat`. `doctor` checks every boat workspace layer by layer and changes nothing; `fix` repairs one with the same steps as resume (`--safe` never force-stops or forks), then moves stale locks and marks the workspace for a wake, or points it at a fork. `watch install` adds a launchd job that fixes a workspace found broken on two runs in a row. `link` runs Orca's server on a sandbox paired as an Orca runtime as a systemd user service, forwards it with a launchd `boat forward` by sandbox id, and pairs it. See Recovering an unrecoverable sandbox in the README.
+
 ## 1.0.4
 
 - Adds the `recovery` setting for a sandbox that is stuck `stopping` and that `boat resume` refuses. Off by default. With `recovery: snapshot`, resume first power-cycles the sandbox with `boat recover`, which leaves its disk alone. If that does not help, it forks the sandbox's latest snapshot with `boat fork` into a new sandbox with the same org, environment and size, and returns the fork so Orca moves the workspace to it. Disk changes made after that snapshot are not on the fork. The stuck sandbox is kept, and resume logs the command to delete it. The setting is stored with the workspace at create time, so workspaces created by 1.0.3 or earlier have recovery off.

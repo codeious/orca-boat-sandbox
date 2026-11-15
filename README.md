@@ -34,7 +34,7 @@ You need Orca 1.4.199 or later, the [Boat.dev CLI](https://boat.dev), and `jq` (
 |---|---|
 | create | Checks your login and settings first, so a typo fails before anything is billed. Then it starts a sandbox and pins its SSH host key from boat's own record. It checks out the branch and commit Orca asked for at `/home/user/<repo name>`, gives git there your [name and email](#git-name-and-email), and runs the repo's `setupScript` if it has one. |
 | suspend | Stops the sandbox. Billing pauses; boat keeps the disk for 14 days. |
-| resume | Starts it again and returns its new address. Puts your git name and email back if the sandbox lost them, and puts back the [machine ID](#machine-id-across-restarts) Orca's server on the sandbox belongs to if boat changed it. If boat cannot resume the sandbox and `recovery` is `snapshot`, it [recovers it](#recovering-an-unrecoverable-sandbox). |
+| resume | Starts it again and returns its new address. Puts your git name and email back if the sandbox lost them, and puts back the [machine ID](#machine-id-across-restarts) Orca's server on the sandbox belongs to if boat changed it. If boat cannot resume the sandbox, it [recovers it](#recovering-an-unrecoverable-sandbox), and it moves stale Orca server locks. |
 | destroy | Deletes the sandbox and its disk. |
 
 It does not install tools or dependencies. A sandbox has what its image or snapshot has. To add more, build a [tools snapshot](#building-a-tools-snapshot) or give the repo a [setup script](#setup-script).
@@ -55,33 +55,52 @@ Resume never fails because of this; if it cannot put the ID back, it warns. Work
 
 ### Recovering an unrecoverable sandbox
 
-Now and then a sandbox gets stuck: `boat info` shows it as `stopping`, and `boat resume` refuses it (`recover_unsupported`). Resume then fails and Orca cannot wake the workspace. Two things get it going again.
+boat breaks sandboxes now and then. `boat info` shows one as `stopping`, or as `degraded` with `EHOSTUNREACH`, and `boat resume` refuses it. Sometimes boat restarts a sandbox under a new address while Orca still shows the workspace as running, or Orca's server on the sandbox will not start because its lock file outlived it. Two things get it going again: resume does it by itself, and `orca-boat` does it from your terminal, or on a timer.
 
-**Automatically, with `recovery: snapshot`.** When boat cannot resume the sandbox, resume does this:
+**In resume.** When boat cannot resume the sandbox, resume tries these steps in order and stops at the first that works:
 
-1. It runs `boat recover`, which power-cycles the sandbox and leaves its disk alone, and resumes again. A hang that a power cycle clears costs no data.
-2. If that fails too, it forks the sandbox's latest disk snapshot (`boat fork`) into a new sandbox. The fork has the same org, environment and size. Resume then does its usual work on the fork (host key, machine ID, git identity) and returns the fork's id, so Orca moves the workspace to it by itself.
+1. `boat recover`, which power-cycles the sandbox and leaves its disk alone. boat refuses this on bare-metal machines, so there resume skips it.
+2. A normal `boat stop`, then a resume. This keeps the disk too, but boat can take many minutes to stop a stuck sandbox; resume waits up to 15 minutes (`ORCA_BOAT_STOP_WAIT`, in seconds).
+3. With `recovery: snapshot` only: `boat stop --force`, then a resume. The sandbox comes back at its latest snapshot.
+4. With `recovery: snapshot` only: a fork of the latest snapshot (`boat fork`) into a new sandbox with the same org, environment and size. Resume does its usual work on the fork (host key, machine ID, git identity) and returns the fork's id, so Orca moves the workspace to it by itself.
 
-Recovery is off by default. Setting it to `snapshot` is your consent for the fork: after that, it happens without asking, because Orca runs resume with no terminal. This is not the `snapshot` setting, which names the image new sandboxes start from; recovery forks the workspace's own snapshot.
+Once the sandbox is up, resume also moves stale Orca server locks to `~/.orca-recovery` on the sandbox, so Orca's server can start.
+
+`recovery` is `snapshot` by default from 1.1.0. It is your consent for steps 3 and 4: they happen without asking, because Orca runs resume with no terminal. Set it to `off` to stop after step 2. This is not the `snapshot` setting, which names the image new sandboxes start from; recovery uses the workspace's own snapshot.
 
 What to know first:
 
-- **Disk changes made after the latest snapshot are not on the fork.** boat snapshots a sandbox when it stops and in the background while it runs, so a sandbox that was running for hours may not have its latest work in the snapshot. Resume logs this when it forks. Uncommitted work and unpushed commits are the ones at risk.
-- **The stuck sandbox is kept.** Resume never deletes it, and it logs the `boat delete` command. Once you are sure nothing in it is needed, delete it with `boat delete`.
+- **Steps 3 and 4 lose disk changes made after the latest snapshot.** boat snapshots a sandbox when it stops and in the background while it runs, so a sandbox that ran for hours may not have its latest work in the snapshot. Resume logs this when it gets there. Uncommitted work and unpushed commits are the ones at risk.
+- **The old sandbox is kept.** Nothing here deletes a sandbox. Resume logs the `boat delete` command; once you are sure nothing in the old sandbox is needed, delete it.
 - **The fork keeps running** until Orca suspends the workspace, like any sandbox the plugin wakes.
-- **Workspaces created before 1.0.4 have recovery off.** Resume learns the setting from what create stored with the workspace, the same way as the machine ID feature. Create the workspace again, or use the helper below.
+- **Create stores the setting with the workspace.** A workspace created before 1.1.0 has `snapshot` stored only if you had set it. One with nothing stored uses `ORCA_BOAT_RECOVERY`, else `defaults.recovery` in your config file, else `off`. So to give older workspaces the full ladder, put `"recovery": "snapshot"` in your file's `defaults`.
 
-**By hand, with `orca-boat-recover`.** The automatic path only runs when Orca runs resume. If boat wedged the sandbox while Orca shows the workspace as running, Orca keeps retrying the old address and never runs resume. The helper next to `orca-boat-wake` handles that, and the case where `recovery` was off:
+**From your terminal, with `orca-boat`.** Resume only runs when Orca asks for it, and Orca does not ask while it shows the workspace as running. `orca-boat` checks and repairs a workspace whatever Orca shows:
 
 ```sh
 p="$HOME/Library/Application Support/Orca/plugins/codeious.boat-sandbox"   # Linux: p="$HOME/.config/Orca/plugins/codeious.boat-sandbox"
-bash "$p/$(cat "$p/current")/bin/orca-boat-recover"                        # list the boat workspaces Orca has
-bash "$p/$(cat "$p/current")/bin/orca-boat-recover" --dry-run <name|bx_id> # show what it would do
-bash "$p/$(cat "$p/current")/bin/orca-boat-recover" <name|bx_id>           # fork it and point the workspace at the fork
+ob() { bash "$p/$(cat "$p/current")/bin/orca-boat" "$@"; }
+ob list                    # the boat workspaces Orca has
+ob doctor                  # check every one; changes nothing
+ob fix <name|bx_id>        # repair one
+ob fix --safe <name|bx_id> # repair one, but never force-stop or fork
 ```
 
-It shows boat's state for the sandbox and the time of its latest snapshot, and refuses a sandbox boat reports as healthy unless you pass `--force`. It forks the snapshot, stops the fork, backs up Orca's `orca-ephemeral-vm-runtimes.json`, and changes only that workspace's sandbox id and status. Then click that workspace in Orca's sidebar: resume runs the usual steps on the fork. Quit Orca first if you can, because Orca rewrites that file while it runs. The same data-loss and kept-sandbox notes apply.
+`doctor` checks each layer and names what is wrong: the sandbox (boat's state and health), the address Orca has against the one boat has, and stale Orca server locks. It runs its check on the sandbox with `boat exec`, so it needs neither SSH nor the address. It exits non-zero when something is broken.
 
+`fix` brings the sandbox up with the same steps as resume, honoring the workspace's `recovery` setting the same way (a linked sandbox, below, has none stored and defaults to `snapshot`), then repairs what sits on top. It moves stale locks. When Orca shows the workspace as running with an old address, or the sandbox was restarted, it marks the workspace for a wake in Orca's `orca-ephemeral-vm-runtimes.json` (backed up first). After a fork it points the workspace at the fork. Then click the workspace in Orca's sidebar and resume returns the new address. Quit Orca first if you can, because Orca rewrites that file while it runs.
+
+**On a timer, with `orca-boat watch`.** `ob watch install` adds a launchd job that runs `orca-boat watch run` every 5 minutes (`--interval SECS`, at least 60). Each run checks every workspace and fixes one only when two runs in a row found it broken, so a sandbox boat is busy restarting is left alone, and fixes the same workspace at most once in 20 minutes. It sends a macOS notification when it fixed something or could not. The log is `~/Library/Logs/OrcaBoatConnections/watch.log`. `ob watch uninstall` removes the job. A watched fix uses the full ladder, fork included, when the workspace's `recovery` is `snapshot`; set it to `off` for workspaces whose disk you do not want touched. watch never wakes a sandbox that is asleep in both boat and Orca.
+
+**A sandbox paired as an Orca runtime, with `orca-boat link`.** Orca can also use a sandbox as a runtime environment (`orca environment add`) instead of over SSH. `ob link <bx_id>` sets that up so that it survives boat's restarts:
+
+- It runs Orca's server on the sandbox as a systemd user service, `orca-boat-orcad.service`, which starts at boot, moves stale locks before it starts, and restarts the server when it dies. It runs the server Orca last installed in `~/.orca-remote`.
+- It adds a launchd job (`dev.codeious.orca.boat.<bx_id>`) that runs `boat forward` by sandbox id, so a new address does not matter.
+- It pairs the sandbox with Orca, unless Orca already has an environment on that local port that is connected.
+
+Options: `--name NAME` for the Orca environment, `--local PORT` (default: the first free one from 61094), `--remote PORT` (default 6768), `--org ORG`. `list`, `doctor`, `fix` and `watch` handle linked sandboxes too: for those they also check the forward, the service and the pairing, and `fix` reloads the forward, restarts the service, or pairs again. After a fork, `fix` moves the forward to the fork and pairs it under a name with the fork's id, then removes the environment that pointed at the old sandbox.
+
+`orca-boat-wake` and `orca-boat-recover` from earlier releases still work; `orca-boat fix` does what both did.
 ## Settings
 
 You do not need any. With none, you get a sandbox from boat's stock image, in your active org, with your default environment and size.
@@ -94,7 +113,7 @@ You do not need any. With none, you get a sandbox from boat's stock image, in yo
 | `machineType` | `small`, `default`, `large` or `xlarge` | `default` | yes |
 | `setupScript` | Path of a script in the repo | none | yes |
 | `ghWrapper` | Install the [gh wrapper](#the-gh-wrapper) | `true` | yes |
-| `recovery` | `off` or `snapshot`: what resume does when boat [cannot resume a sandbox](#recovering-an-unrecoverable-sandbox) | `off` | yes |
+| `recovery` | `off` or `snapshot`: whether resume and `orca-boat fix` may force-stop or fork a sandbox boat [cannot resume](#recovering-an-unrecoverable-sandbox) | `snapshot` | yes |
 | `sshUser` | SSH user in the sandbox | `user` | no |
 | `identityFile` | SSH key boat set up for you | `~/.ssh/ascii_box_ed25519` | no |
 
@@ -253,10 +272,10 @@ Anyone who can run code in a sandbox can read the variables, files and logins bo
   5. **Snapshot.** It must not have been built from a `--no-env` sandbox. In a sandbox kept with `ORCA_BOAT_KEEP_ON_ERROR=1`, `boat info <id> --json` shows `"holdsCreatorLogins": true` when boat injected your logins.
 
   A public repo needs none of this.
-- **Resume fails with "boat cannot resume bx_…", or the sandbox is stuck `stopping`.** See [Recovering an unrecoverable sandbox](#recovering-an-unrecoverable-sandbox).
+- **Resume fails with "boat cannot resume bx_…", or the sandbox is stuck `stopping` or `degraded`.** Run `orca-boat doctor`, then `orca-boat fix`. See [Recovering an unrecoverable sandbox](#recovering-an-unrecoverable-sandbox).
 - **Resume warns that git cannot reach GitHub.** Resume waits 30 seconds and then carries on. The checkout is intact, and fetch and push work once boat restores the login.
 - **"Author identity unknown" when you commit in the sandbox.** A workspace created before 1.0.2 has no git name and email. Set them in the sandbox with `git config --global user.name "<name>"` and `git config --global user.email "<email>"`, or create the workspace again. From 1.0.2 on, a create log line "no usable git user.name and user.email" means your own git has none for the repo: set them on your machine, then create the workspace again.
-- **"SSH sign-in for boat-bx_… was cancelled" or `orcad_identity_mismatch` after boat restarted a sandbox.** If boat restarts a sandbox while Orca shows the workspace as running, the sandbox gets a new address, and Orca keeps trying the old one. Orca runs the plugin's resume only for a workspace that is asleep or whose last wake failed. Cancel any sign-in prompt that shows the old address, because that address may now belong to someone else's sandbox. Then mark the workspace for a wake with the helper that ships with the plugin:
+- **"SSH sign-in for boat-bx_… was cancelled" or `orcad_identity_mismatch` after boat restarted a sandbox.** If boat restarts a sandbox while Orca shows the workspace as running, the sandbox gets a new address, and Orca keeps trying the old one. Orca runs the plugin's resume only for a workspace that is asleep or whose last wake failed. Cancel any sign-in prompt that shows the old address, because that address may now belong to someone else's sandbox. Then run `orca-boat fix <name|bx_id>` (see [Recovering an unrecoverable sandbox](#recovering-an-unrecoverable-sandbox)), which marks the workspace for a wake, or mark it with the older helper:
 
   ```sh
   p="$HOME/Library/Application Support/Orca/plugins/codeious.boat-sandbox"   # Linux: p="$HOME/.config/Orca/plugins/codeious.boat-sandbox"
@@ -277,7 +296,7 @@ Orca gives a recipe command neither this folder nor any settings, so `recipes/bo
 ```sh
 node build.mjs           # regenerate recipes/boat-sandbox.json after editing src/
 node build.mjs --check   # recipe is current; bash -n, shellcheck, bash 3.2 lint
-bash test/config-test.sh # free tests; boat is a stub
+bash test/config-test.sh # free tests; boat, ssh, orca and launchctl are stubs
 ```
 
 `test/run-phase.sh` runs a real create, suspend, resume and destroy cycle on a repo you name. It bills, so it needs `--confirm-paid`; `--dry-run` shows what it would do.

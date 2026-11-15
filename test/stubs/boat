@@ -5,15 +5,30 @@
 #   boat status        -> status.json            boat env list        -> env-list.json
 #   boat org list      -> org-list.json          boat env info NAME   -> env-info-NAME.json
 #   boat snapshot latest ID -> snapshot-latest.json
-#   boat <cmd> ...     -> <cmd>.json             <fixture>.rc holds a non-zero exit code
+#   boat <cmd> ID ...  -> <cmd>-ID.json when it exists, else <cmd>.json
+#   boat exec ID ... -- bash -c "# orca-boat:NAME ..." -> exec-NAME.json; the script goes to
+#                         exec-scripts.log and the log line ends in script:NAME instead
+#   <fixture>.rc holds a non-zero exit code
 #   <fixture>.N (and <fixture>.N.rc) answers the Nth call of that command instead
 set -u
-printf '%s\n' "$*" >>"${BOAT_STUB_LOG:?}"
+
+marker=""
+all="$*"
+for a in "$@"; do
+  case "$a" in
+    "# orca-boat:"*)
+      marker="${a#"# orca-boat:"}"
+      marker="${marker%%$'\n'*}"
+      printf '%s\n-----\n' "$a" >>"${BOAT_STUB_DIR:?}/exec-scripts.log"
+      ;;
+  esac
+done
 
 words=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --org) shift 2 || break ;;
+    --) break ;;
     -*) shift ;;
     *)
       words+=("$1")
@@ -21,6 +36,12 @@ while [ $# -gt 0 ]; do
       ;;
   esac
 done
+
+if [ -n "$marker" ]; then
+  printf 'exec %s script:%s\n' "${words[1]:-}" "$marker" >>"${BOAT_STUB_LOG:?}"
+else
+  printf '%s\n' "$all" >>"${BOAT_STUB_LOG:?}"
+fi
 
 reply() {
   local fixture="$BOAT_STUB_DIR/$1" rc=0 calls=0
@@ -39,9 +60,15 @@ reply() {
   exit 1
 }
 
-case "${words[0]:-}" in
+cmd="${words[0]:-none}"
+id="${words[1]:-}"
+case "$cmd" in
   env) reply "env-${words[1]:-}${words[2]:+-${words[2]}}.json" ;;
   org) reply "org-${words[1]:-}.json" ;;
   snapshot) reply "snapshot-${words[1]:-}.json" ;;
-  *) reply "${words[0]:-none}.json" ;;
+  exec) reply "exec-${marker:-none}.json" ;;
 esac
+case "$id" in
+  bx_*) if [ -f "$BOAT_STUB_DIR/$cmd-$id.json" ] || [ -f "$BOAT_STUB_DIR/$cmd-$id.json.1" ]; then reply "$cmd-$id.json"; fi ;;
+esac
+reply "$cmd.json"

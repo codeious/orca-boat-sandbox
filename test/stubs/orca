@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Test double for the orca CLI. Appends its arguments to $BOAT_STUB_DIR/orca.log and answers from
+# fixture files there, like test/stubs/boat (<fixture>.N answers the Nth call, <fixture>.rc an exit code):
+#
+#   orca environment list        -> orca-env-list.json
+#   orca environment add ...     -> orca-env-add.json
+#   orca environment rm ...      -> orca-env-rm.json
+#   orca status --environment ID -> orca-status-ID.json when it exists, else orca-status.json
+set -u
+dir="${BOAT_STUB_DIR:?}"
+printf '%s\n' "$*" >>"$dir/orca.log"
+
+reply() {
+  local fixture="$dir/$1" rc=0 calls=0
+  if [ -f "$fixture.count" ]; then calls="$(cat "$fixture.count")"; fi
+  calls=$((calls + 1))
+  printf '%s' "$calls" >"$fixture.count"
+  if [ -f "$fixture.$calls" ]; then fixture="$fixture.$calls"; fi
+  if [ -f "$fixture" ]; then
+    cat "$fixture"
+    if [ -f "$fixture.rc" ]; then rc="$(cat "$fixture.rc")"; fi
+    exit "$rc"
+  fi
+  printf '{"error":{"message":"stub has no fixture %s"}}\n' "$1"
+  exit 1
+}
+
+case "${1:-} ${2:-}" in
+  "environment list") reply orca-env-list.json ;;
+  "environment add") reply orca-env-add.json ;;
+  "environment rm") reply orca-env-rm.json ;;
+esac
+if [ "${1:-}" = status ]; then
+  env=""
+  while [ $# -gt 0 ]; do
+    if [ "$1" = --environment ]; then env="${2:-}"; fi
+    shift
+  done
+  if [ -n "$env" ] && [ -f "$dir/orca-status-$env.json" ]; then reply "orca-status-$env.json"; fi
+  reply orca-status.json
+fi
+reply "orca-${1:-none}.json"
