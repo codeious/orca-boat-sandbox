@@ -1,0 +1,39 @@
+.github/workflows/check.yml
+  s_f2deae8ba0bec6::t_04919586780ccf 33
+README.md
+  s_93b6acc5c85e1c::t_d276cfcf4b580a 37,58,60,62-65,67-69,73-74,76,78,82-86,89-101,103,116,275,278,299
+bin/orca-boat
+  s_93b6acc5c85e1c::t_66d168874f4765 1-991
+recipes/boat-sandbox.json
+  s_f2deae8ba0bec6::t_d8c779399fb0b7 7-10
+test/config-test.sh
+  s_93b6acc5c85e1c::t_3ef5bb2c2ff827 5-6,177,426,467-478,482,1024-1027,1030-1058,1098-1099,1109-1125,1351-1624
+test/stubs/launchctl
+  s_f2deae8ba0bec6::t_f5fcf198b56922 1-20
+test/stubs/orca
+  s_f2deae8ba0bec6::t_c41269c9bf77b1 1-42
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7126ee3078ea0a704d7d3ce09311077a71bba192",
+  "prompts": {},
+  "sessions": {
+    "s_93b6acc5c85e1c": {
+      "agent_id": {
+        "tool": "droid",
+        "id": "725ade33-c826-4ec6-9c65-3b38e50bbe2e",
+        "model": "custom:claude-opus-5-5"
+      },
+      "human_author": "noter <patryk@codeious.io>"
+    },
+    "s_f2deae8ba0bec6": {
+      "agent_id": {
+        "tool": "droid",
+        "id": "9b7378cc-60d1-4229-9a8c-4ef9fa17ce8e",
+        "model": "custom:claude-opus-5-5"
+      },
+      "human_author": "noter <patryk@codeious.io>"
+    }
+  }
+}
