@@ -73,9 +73,9 @@ lib_eval() {
 }
 
 # Runs one generated recipe command exactly as Orca does: `sh -c "<command>"` with stdin attached.
-run_recipe() { # phase
+run_recipe() { # phase [recipe file name]
   local errf="$TMP/err" command
-  command="$(jq -r --arg p "$1" '.[$p]' "$ROOT/recipes/boat-sandbox.json")"
+  command="$(jq -r --arg p "$1" '.[$p]' "$ROOT/recipes/${2:-boat-sandbox.json}")"
   RC=0
   # shellcheck disable=SC2086 # EXTRA_ENV is a list of VAR=value words
   OUT="$(env -i PATH="$BASE_PATH" HOME="$HOME_DIR" ORCA_REPO_PATH="$REPO_DIR" GIT_CONFIG_NOSYSTEM=1 \
@@ -117,6 +117,12 @@ lib_eval "$load_values"
 expect_has "layer 1: environment beats the user repo entry" "$OUT" "|small|"
 expect_has "layer 1 sets org" "$OUT" "Acme|"
 expect_has "layer 1 is named in the log" "$ERR" "machineType = small (from ORCA_BOAT_MACHINE_TYPE)"
+
+EXTRA_ENV="ORCA_BOAT_MACHINE_TYPE=small"
+lib_eval 'PICKED_MACHINE_TYPE=xlarge; '"$load_values"
+expect_has "a size recipe beats every layer" "$OUT" "|xlarge|"
+expect_has "...and the log says so" "$ERR" "machineType = xlarge (from the recipe picked in Orca)"
+expect_lacks "...without naming the layer it overrode" "$ERR" "from ORCA_BOAT_MACHINE_TYPE"
 
 reset
 user_cfg '{"repos":{"other/repo":{"machineType":"large"}}}'
@@ -897,6 +903,39 @@ expect_eq "create records ghWrapper=false for later phases" "false" "$(printf '%
 expect_eq "create leaves org out of userData" "false" "$(printf '%s' "$OUT" | jq '.userData | has("org")')"
 expect_has "create warns when this machine has no git identity" "$ERR" "no usable git user.name and user.email"
 expect_eq "...and records none" "false" "$(printf '%s' "$OUT" | jq '.userData | has("gitName")')"
+
+# --- size recipes ---------------------------------------------------------------------------------
+for size in small default large xlarge; do
+  file="boat-sandbox-$size.json"
+  expect_eq "$file is the $size recipe" "boat-sandbox-$size" "$(jq -r .id "$ROOT/recipes/$file")"
+  expect_eq "...and the manifest lists it" "1" \
+    "$(jq --arg p "recipes/$file" '[.contributes.vmRecipes[] | select(.path == $p)] | length' "$ROOT/orca-plugin.json")"
+  for phase in suspend resume destroy; do
+    expect_eq "...its $phase differs from the main recipe only in the size" "PICKED_MACHINE_TYPE=$size" \
+      "$(diff <(jq -r --arg p "$phase" '.[$p]' "$ROOT/recipes/boat-sandbox.json") \
+        <(jq -r --arg p "$phase" '.[$p]' "$ROOT/recipes/$file") | sed -n 's/^> //p')"
+  done
+done
+expect_eq "the main recipe keeps its id, so existing workspaces still find it" "boat-sandbox" \
+  "$(jq -r .id "$ROOT/recipes/boat-sandbox.json")"
+
+reset
+fake_sandbox
+repo_cfg '{"machineType":"xlarge"}'
+user_cfg '{"repos":{"acme/widgets":{"machineType":"small"}}}'
+EXTRA_ENV="$create_env ORCA_REPO_URL=git@github.com:acme/widgets.git ORCA_BOAT_MACHINE_TYPE=default"
+run_recipe create boat-sandbox-large.json
+expect_ok "create from the large recipe"
+expect_has "...starts a large sandbox whatever the settings say" "$(cat "$LOG")" "new --json --type large --no-auto-stop"
+expect_has "...and logs where the size came from" "$ERR" "machineType = large (from the recipe picked in Orca)"
+
+reset
+fake_sandbox
+repo_cfg '{"machineType":"huge"}'
+EXTRA_ENV="$create_env ORCA_REPO_URL=git@github.com:acme/widgets.git"
+run_recipe create boat-sandbox-small.json
+expect_ok "a size recipe ignores an invalid machineType setting it overrides"
+expect_has "...and starts a small sandbox" "$(cat "$LOG")" "new --json --type small --no-auto-stop"
 
 reset
 fake_sandbox

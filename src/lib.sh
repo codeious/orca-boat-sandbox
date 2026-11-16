@@ -42,6 +42,8 @@ ORG=""
 ENVIRONMENT=""
 SNAPSHOT=""
 MACHINE_TYPE=default
+# Empty in the main recipe. build.mjs sets it in each size recipe, where it beats every setting layer.
+PICKED_MACHINE_TYPE=""
 SETUP_SCRIPT=""
 GH_WRAPPER=true
 RECOVERY=off
@@ -207,7 +209,13 @@ load_config() {
   load_setting ORG org ORCA_BOAT_ORG ""
   load_setting ENVIRONMENT environment ORCA_BOAT_ENVIRONMENT ""
   load_setting SNAPSHOT snapshot ORCA_BOAT_SNAPSHOT ""
-  load_setting MACHINE_TYPE machineType ORCA_BOAT_MACHINE_TYPE default
+  if [ -n "$PICKED_MACHINE_TYPE" ]; then
+    MACHINE_TYPE="$PICKED_MACHINE_TYPE"
+    MACHINE_TYPE_SRC="the recipe picked in Orca"
+    log "config: machineType = $MACHINE_TYPE (from the recipe picked in Orca)"
+  else
+    load_setting MACHINE_TYPE machineType ORCA_BOAT_MACHINE_TYPE default
+  fi
   load_setting SETUP_SCRIPT setupScript ORCA_BOAT_SETUP_SCRIPT ""
   load_setting GH_WRAPPER ghWrapper ORCA_BOAT_GH_WRAPPER true
   load_setting RECOVERY recovery ORCA_BOAT_RECOVERY snapshot

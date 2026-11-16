@@ -21,7 +21,7 @@ You need Orca 1.4.199 or later, the [Boat.dev CLI](https://boat.dev), and `jq` (
 3. In Orca, open **Settings → Plugins** and turn plugins on.
 4. Add the marketplace `https://github.com/codeious/orca-plugins.git`.
 5. Install **Boat.dev Sandbox**, read the commands Orca shows, and approve them.
-6. When you create a workspace, pick **Run on: Boat.dev sandbox**.
+6. When you create a workspace, pick **Run on: Boat.dev sandbox**, or one of its [size entries](#picking-the-size-per-workspace).
 
 **Updating:** Orca keeps its own copy of the marketplace and does not see a new release until you refresh it.
 1. In **Settings → Plugins**, click **Refresh** in the marketplace.
@@ -111,7 +111,7 @@ You do not need any. With none, you get a sandbox from boat's stock image, in yo
 | `org` | Boat organization name or id (`boat org list`) | your active org | yes |
 | `environment` | Boat environment (`boat env list`) | your default environment | yes |
 | `snapshot` | Named snapshot or `bsh_` share code to start from | boat's stock image | yes |
-| `machineType` | `small`, `default`, `large` or `xlarge` | `default` | yes |
+| `machineType` | `small`, `default`, `large` or `xlarge`; a [size entry](#picking-the-size-per-workspace) in **Run on** beats it | `default` | yes |
 | `setupScript` | Path of a script in the repo | none | yes |
 | `ghWrapper` | Install the [gh wrapper](#the-gh-wrapper) | `true` | yes |
 | `recovery` | `off` or `snapshot`: whether resume and `orca-boat fix` may force-stop or fork a sandbox boat [cannot resume](#recovering-an-unrecoverable-sandbox) | `snapshot` | yes |
@@ -138,6 +138,20 @@ Each setting takes the first value it finds, from top to bottom:
 ```
 
 Your `defaults` apply only where the repo file sets nothing; a `repos` entry wins over the repo file. A repo name matches without regard to letter case. The create log says which layer each value came from. If a named org, environment or snapshot does not exist, create stops before it starts a sandbox, and the error names the layer and how to override it.
+
+### Picking the size per workspace
+
+Orca cannot ask a plugin for input when you create a workspace, so the plugin adds one entry per size under **Run on**:
+
+| Run on | Size |
+|---|---|
+| Boat.dev sandbox | `machineType` from your settings, above |
+| Boat.dev sandbox (small) | `small` |
+| Boat.dev sandbox (default size) | `default` |
+| Boat.dev sandbox (large) | `large` |
+| Boat.dev sandbox (xlarge) | `xlarge` |
+
+A size entry beats `machineType` from every layer, including `ORCA_BOAT_MACHINE_TYPE`. The create log says `machineType = large (from the recipe picked in Orca)`. The size is fixed when the sandbox is created; suspend and resume keep it, and so does a [recovery fork](#recovering-an-unrecoverable-sandbox). The entries differ only in the size, so when Orca asks you to approve the plugin, the five sets of commands it shows are the same apart from the size.
 
 ### Setup script
 
@@ -286,10 +300,10 @@ Anyone who can run code in a sandbox can read the variables, files and logins bo
 
 ## Development
 
-Orca gives a recipe command neither this folder nor any settings, so `recipes/boat-sandbox.json` is generated. `build.mjs` copies the library functions each phase calls from `src/lib.sh`, without their doc comments, into that phase's script from `src/`, and writes it as one `exec bash -c '...'` command. Orca allows 32 KiB per command; `node build.mjs` prints the sizes. Scripts must run on bash 3.2, the macOS system bash.
+Orca gives a recipe command neither this folder nor any settings, so the recipes in `recipes/` are generated. `build.mjs` copies the library functions each phase calls from `src/lib.sh`, without their doc comments, into that phase's script from `src/`, and writes it as one `exec bash -c '...'` command. It writes `recipes/boat-sandbox.json` and one `recipes/boat-sandbox-<size>.json` per size, which differs only in `PICKED_MACHINE_TYPE`. Orca allows 32 KiB per command; `node build.mjs` prints the sizes. Scripts must run on bash 3.2, the macOS system bash.
 
 ```sh
-node build.mjs           # regenerate recipes/boat-sandbox.json after editing src/
+node build.mjs           # regenerate the recipes in recipes/ after editing src/
 node build.mjs --check   # recipe is current; bash -n, shellcheck, bash 3.2 lint
 bash test/config-test.sh # free tests; boat, ssh, orca and launchctl are stubs
 ```

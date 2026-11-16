@@ -1,11 +1,14 @@
 #!/usr/bin/env node
-// Builds recipes/boat-sandbox.json from src/. Orca gives a recipe command neither this folder nor any
+// Builds the recipes in recipes/ from src/. Orca gives a recipe command neither this folder nor any
 // settings, so each phase becomes one self-contained `exec bash -c '...'` command: the library
 // functions that phase calls, then the phase script. `exec` keeps stdin, which carries Orca's
 // lifecycle JSON. No dependencies: Orca installs this folder as is, node_modules included.
 //
-//   node build.mjs          write recipes/boat-sandbox.json
-//   node build.mjs --check  fail if it is out of date or any phase is unsound
+// Orca has no way to ask for input when it starts a workspace, so each sandbox size is its own
+// recipe, listed under "Run on". A size recipe is the main one with PICKED_MACHINE_TYPE set.
+//
+//   node build.mjs          write the recipes
+//   node build.mjs --check  fail if any is out of date or any phase is unsound
 
 import { spawnSync } from 'node:child_process'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -14,7 +17,23 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = dirname(fileURLToPath(import.meta.url))
-const RECIPE_PATH = 'recipes/boat-sandbox.json'
+const DESCRIPTION =
+  'Runs the workspace in a fresh boat.dev sandbox and checks out the repo there. Needs the boat CLI and jq on macOS or Linux.'
+const RECIPES = [
+  { path: 'recipes/boat-sandbox.json', id: 'boat-sandbox', name: 'Boat.dev sandbox', size: '' },
+  ...[
+    ['small', 'small'],
+    ['default', 'default size'],
+    ['large', 'large'],
+    ['xlarge', 'xlarge']
+  ].map(([size, label]) => ({
+    path: `recipes/boat-sandbox-${size}.json`,
+    id: `boat-sandbox-${size}`,
+    name: `Boat.dev sandbox (${label})`,
+    size
+  }))
+]
+const PICKED_LINE = 'PICKED_MACHINE_TYPE=""'
 const PHASES = ['create', 'suspend', 'resume', 'destroy']
 const MAX_COMMAND_BYTES = 32 * 1024
 const MAX_RECIPE_BYTES = 256 * 1024
@@ -129,27 +148,37 @@ function toCommand(phase, script) {
   return command
 }
 
-function buildRecipe() {
+function withSize(script, phase, size) {
+  if (!size) return script
+  if (script.split('\n').filter((line) => line === PICKED_LINE).length !== 1) {
+    fail(`${phase}: lib.sh must assign ${PICKED_LINE} exactly once, on a line of its own`)
+  }
+  return script.replace(`\n${PICKED_LINE}\n`, `\nPICKED_MACHINE_TYPE=${size}\n`)
+}
+
+function buildRecipes() {
   const manifest = JSON.parse(read('orca-plugin.json'))
   const library = parseLibrary(read('src/lib.sh'))
   const scripts = {}
-  const commands = {}
-  for (const phase of PHASES) {
-    scripts[phase] = assemble(phase, library, manifest.repository)
-    commands[phase] = toCommand(phase, scripts[phase])
-  }
-  const recipe = {
-    schemaVersion: 1,
-    id: 'boat-sandbox',
-    name: 'Boat.dev sandbox',
-    description:
-      'Runs the workspace in a fresh boat.dev sandbox and checks out the repo there. Needs the boat CLI and jq on macOS or Linux.',
-    checkoutMode: 'provisioned-root',
-    ...commands
-  }
-  const json = `${JSON.stringify(recipe, null, 2)}\n`
-  if (bytes(json) > MAX_RECIPE_BYTES) fail(`recipe file is ${bytes(json)} bytes, over ${MAX_RECIPE_BYTES}`)
-  return { json, scripts, commands }
+  for (const phase of PHASES) scripts[phase] = assemble(phase, library, manifest.repository)
+  const recipes = RECIPES.map(({ path, id, name, size }) => {
+    const commands = {}
+    for (const phase of PHASES) commands[phase] = toCommand(phase, withSize(scripts[phase], phase, size))
+    const recipe = {
+      schemaVersion: 1,
+      id,
+      name,
+      description: size
+        ? `${DESCRIPTION} Always starts a ${size} sandbox, whatever the machineType setting says.`
+        : DESCRIPTION,
+      checkoutMode: 'provisioned-root',
+      ...commands
+    }
+    const json = `${JSON.stringify(recipe, null, 2)}\n`
+    if (bytes(json) > MAX_RECIPE_BYTES) fail(`${path} is ${bytes(json)} bytes, over ${MAX_RECIPE_BYTES}`)
+    return { path, json, commands }
+  })
+  return { recipes, scripts }
 }
 
 function checkScripts(scripts) {
@@ -184,9 +213,9 @@ function checkScripts(scripts) {
 function checkManifest() {
   const problems = []
   const manifest = JSON.parse(read('orca-plugin.json'))
-  if (manifest.contributes?.vmRecipes?.[0]?.path !== RECIPE_PATH) {
-    problems.push(`orca-plugin.json must contribute ${RECIPE_PATH}`)
-  }
+  const contributed = (manifest.contributes?.vmRecipes ?? []).map((entry) => entry.path).join(', ')
+  const wanted = RECIPES.map((recipe) => recipe.path).join(', ')
+  if (contributed !== wanted) problems.push(`orca-plugin.json vmRecipes must be, in order: ${wanted}`)
   if (!/^>=\d+\.\d+\.\d+$/.test(manifest.engines?.orca ?? '')) {
     problems.push('orca-plugin.json engines.orca must look like ">=1.4.199"')
   }
@@ -200,21 +229,28 @@ function checkManifest() {
   return problems
 }
 
-const { json, scripts, commands } = buildRecipe()
-for (const phase of PHASES) console.log(`build: ${phase.padEnd(8)} ${bytes(commands[phase])} / ${MAX_COMMAND_BYTES} bytes`)
+const { recipes, scripts } = buildRecipes()
+for (const phase of PHASES) {
+  const largest = Math.max(...recipes.map((recipe) => bytes(recipe.commands[phase])))
+  console.log(`build: ${phase.padEnd(8)} ${largest} / ${MAX_COMMAND_BYTES} bytes`)
+}
 
 if (process.argv.includes('--check')) {
   const problems = [...checkManifest(), ...checkScripts(scripts)]
-  let current = ''
-  try {
-    current = read(RECIPE_PATH)
-  } catch {
-    // reported below
+  for (const { path, json } of recipes) {
+    let current = ''
+    try {
+      current = read(path)
+    } catch {
+      // reported below
+    }
+    if (current !== json) problems.push(`${path} is out of date; run: node build.mjs`)
   }
-  if (current !== json) problems.push(`${RECIPE_PATH} is out of date; run: node build.mjs`)
   if (problems.length > 0) fail(`check failed:\n${problems.map((p) => `- ${p}`).join('\n')}`)
   console.log('build: check passed')
 } else {
-  writeFileSync(join(ROOT, RECIPE_PATH), json)
-  console.log(`build: wrote ${RECIPE_PATH}`)
+  for (const { path, json } of recipes) {
+    writeFileSync(join(ROOT, path), json)
+    console.log(`build: wrote ${path}`)
+  }
 }

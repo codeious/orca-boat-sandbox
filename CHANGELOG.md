@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.2.0
+
+- Adds a recipe per sandbox size, so you pick the size when you create a workspace: under **Run on**, choose **Boat.dev sandbox (small)**, **(default size)**, **(large)** or **(xlarge)**. A size recipe beats `machineType` from every layer. **Boat.dev sandbox** still takes the size from your settings, and workspaces created before 1.2.0 keep working.
 ## 1.1.1
 
 - Docs only. The README says `orca-boat watch` and `orca-boat link` need macOS, and Security covers what `orca-boat` changes on your machine and the sandbox.
