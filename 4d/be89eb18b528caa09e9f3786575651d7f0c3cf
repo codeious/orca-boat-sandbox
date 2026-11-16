@@ -1,0 +1,37 @@
+build.mjs
+  s_0fac14e05d9b7e::t_48c08009a4bd30 2,7-11,20-36,151-159,163-181,216-218,232-236,240-247,252-255
+recipes/boat-sandbox-default.json
+  s_f2deae8ba0bec6::t_bf89e6d21b46c0 1-11
+recipes/boat-sandbox-large.json
+  s_f2deae8ba0bec6::t_6234832bb68beb 1-11
+recipes/boat-sandbox-small.json
+  s_f2deae8ba0bec6::t_983db323fb8fad 1-11
+recipes/boat-sandbox-xlarge.json
+  s_f2deae8ba0bec6::t_00f391dac06e6f 1-11
+recipes/boat-sandbox.json
+  s_f2deae8ba0bec6::t_9107cf967b4d89 7-10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4dbe89eb18b528caa09e9f3786575651d7f0c3cf",
+  "prompts": {},
+  "sessions": {
+    "s_0fac14e05d9b7e": {
+      "agent_id": {
+        "tool": "droid",
+        "id": "80f74e4a-e5db-4d4c-895a-dd482590df27",
+        "model": "custom:claude-opus-5-5"
+      },
+      "human_author": "noter <patryk@codeious.io>"
+    },
+    "s_f2deae8ba0bec6": {
+      "agent_id": {
+        "tool": "droid",
+        "id": "9b7378cc-60d1-4229-9a8c-4ef9fa17ce8e",
+        "model": "custom:claude-opus-5-5"
+      },
+      "human_author": "noter <patryk@codeious.io>"
+    }
+  }
+}
