@@ -1,0 +1,14 @@
+README.md
+  h_476903bd8a47d9 7,104,260-261,281
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4894f937107cf16b3d2d51c8eb0caf737f5a3d0e",
+  "prompts": {},
+  "humans": {
+    "h_476903bd8a47d9": {
+      "author": "noter <patryk@codeious.io>"
+    }
+  }
+}
