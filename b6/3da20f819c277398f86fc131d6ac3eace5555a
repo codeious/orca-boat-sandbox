@@ -1,0 +1,16 @@
+CHANGELOG.md
+  h_476903bd8a47d9 3-5
+orca-plugin.json
+  h_476903bd8a47d9 6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b63da20f819c277398f86fc131d6ac3eace5555a",
+  "prompts": {},
+  "humans": {
+    "h_476903bd8a47d9": {
+      "author": "noter <patryk@codeious.io>"
+    }
+  }
+}
