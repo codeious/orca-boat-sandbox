@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.1.1
+
+- Docs only. The README says `orca-boat watch` and `orca-boat link` need macOS, and Security covers what `orca-boat` changes on your machine and the sandbox.
 ## 1.1.0
 
 - `recovery` is `snapshot` by default. Create stores it with the workspace, `off` included, so a later change of the default does not change an existing workspace. A workspace with nothing stored (created by 1.0.4 or earlier without the setting) uses `ORCA_BOAT_RECOVERY`, else `defaults.recovery` in your config file, else `off`.
