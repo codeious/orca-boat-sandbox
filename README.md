@@ -4,7 +4,7 @@ An [Orca](https://github.com/stablyai/orca) plugin that runs each workspace in i
 
 It works with any Boat.dev account and any GitHub repo. With no settings, you get boat's stock Ubuntu image. A team can share a boat organization, an environment with logins and secrets, and a tools snapshot, so everyone's workspaces start the same way.
 
-**Supported:** macOS and Linux desktops, and repos on github.com.
+**Supported:** macOS and Linux desktops, and repos on github.com. The `orca-boat watch` and `orca-boat link` commands use launchd, so they need macOS.
 
 **Not supported:**
 - **Windows.** Orca runs plugin commands with `cmd.exe` there, and these commands are bash scripts.
@@ -101,6 +101,7 @@ ob fix --safe <name|bx_id> # repair one, but never force-stop or fork
 Options: `--name NAME` for the Orca environment, `--local PORT` (default: the first free one from 61094), `--remote PORT` (default 6768), `--org ORG`. `list`, `doctor`, `fix` and `watch` handle linked sandboxes too: for those they also check the forward, the service and the pairing, and `fix` reloads the forward, restarts the service, or pairs again. After a fork, `fix` moves the forward to the fork and pairs it under a name with the fork's id, then removes the environment that pointed at the old sandbox.
 
 `orca-boat-wake` and `orca-boat-recover` from earlier releases still work; `orca-boat fix` does what both did.
+
 ## Settings
 
 You do not need any. With none, you get a sandbox from boat's stock image, in your active org, with your default environment and size.
@@ -256,6 +257,8 @@ A sandbox bills from the moment it starts until Orca suspends or deletes it. A s
 
 The commands Orca shows you run on your machine. They call `boat`, `ssh` and `ssh-keygen`, read your boat login state and your git name and email, and add or remove entries for sandbox hosts in `~/.ssh/known_hosts`. Each host key comes from boat's own record, so the first connection is not trust-on-first-use. On the sandbox, they use `sudo` for two things only: installing the [gh wrapper](#the-gh-wrapper), and writing back the [machine ID](#machine-id-across-restarts). Nothing is sent anywhere except to boat and to your sandbox.
 
+`orca-boat` is not one of the commands Orca shows you; it runs only when you start it, or from the launchd job `orca-boat watch install` adds. Besides what resume does, it edits Orca's `orca-ephemeral-vm-runtimes.json` (after a backup), and `link` adds a launchd job on your machine, a systemd user service on the sandbox, and uses `sudo` there once to turn on lingering for your user.
+
 A repo's `.orca-boat.json` can choose the org, environment, snapshot and setup script, and the repo's code runs in the sandbox anyway. Use the plugin on repos you trust, and name only snapshots you trust. The plugin never prints a remote URL, because one can hold a token.
 
 Anyone who can run code in a sandbox can read the variables, files and logins boat put there. Rotate a shared key when someone leaves the team.
@@ -275,15 +278,7 @@ Anyone who can run code in a sandbox can read the variables, files and logins bo
 - **Resume fails with "boat cannot resume bx_…", or the sandbox is stuck `stopping` or `degraded`.** Run `orca-boat doctor`, then `orca-boat fix`. See [Recovering an unrecoverable sandbox](#recovering-an-unrecoverable-sandbox).
 - **Resume warns that git cannot reach GitHub.** Resume waits 30 seconds and then carries on. The checkout is intact, and fetch and push work once boat restores the login.
 - **"Author identity unknown" when you commit in the sandbox.** A workspace created before 1.0.2 has no git name and email. Set them in the sandbox with `git config --global user.name "<name>"` and `git config --global user.email "<email>"`, or create the workspace again. From 1.0.2 on, a create log line "no usable git user.name and user.email" means your own git has none for the repo: set them on your machine, then create the workspace again.
-- **"SSH sign-in for boat-bx_… was cancelled" or `orcad_identity_mismatch` after boat restarted a sandbox.** If boat restarts a sandbox while Orca shows the workspace as running, the sandbox gets a new address, and Orca keeps trying the old one. Orca runs the plugin's resume only for a workspace that is asleep or whose last wake failed. Cancel any sign-in prompt that shows the old address, because that address may now belong to someone else's sandbox. Then run `orca-boat fix <name|bx_id>` (see [Recovering an unrecoverable sandbox](#recovering-an-unrecoverable-sandbox)), which marks the workspace for a wake, or mark it with the older helper:
-
-  ```sh
-  p="$HOME/Library/Application Support/Orca/plugins/codeious.boat-sandbox"   # Linux: p="$HOME/.config/Orca/plugins/codeious.boat-sandbox"
-  bash "$p/$(cat "$p/current")/bin/orca-boat-wake"              # list the boat workspaces Orca has
-  bash "$p/$(cat "$p/current")/bin/orca-boat-wake" <name|bx_id> # mark one for a wake
-  ```
-
-  It backs up Orca's `orca-ephemeral-vm-runtimes.json` and changes only that workspace's status. Then click that workspace itself in Orca's sidebar; another worktree of the same repo does not wake the sandbox. Resume returns the new address and, from 1.0.3, [puts back the machine ID](#machine-id-across-restarts). A workspace created before 1.0.3 can still report `orcad_identity_mismatch` after this; create the workspace again.
+- **"SSH sign-in for boat-bx_… was cancelled" or `orcad_identity_mismatch` after boat restarted a sandbox.** If boat restarts a sandbox while Orca shows the workspace as running, the sandbox gets a new address, and Orca keeps trying the old one. Orca runs the plugin's resume only for a workspace that is asleep or whose last wake failed. Cancel any sign-in prompt that shows the old address, because that address may now belong to someone else's sandbox. Then run `orca-boat fix <name|bx_id>` (see [Recovering an unrecoverable sandbox](#recovering-an-unrecoverable-sandbox)), which marks the workspace for a wake. It backs up Orca's `orca-ephemeral-vm-runtimes.json` and changes only that workspace's status. Then click that workspace itself in Orca's sidebar; another worktree of the same repo does not wake the sandbox. Resume returns the new address and, from 1.0.3, [puts back the machine ID](#machine-id-across-restarts). A workspace created before 1.0.3 can still report `orcad_identity_mismatch` after this; create the workspace again.
 - **Resume warns "the sandbox's machine ID matches none Orca's server could belong to".** Orca's server on the sandbox was set up under a machine ID the plugin never saw. If Orca then reports `orcad_identity_mismatch`, create the workspace again.
 - **A tool is "command not found" in the sandbox.** It is probably in `~/.local/bin` only. See [Building a tools snapshot](#building-a-tools-snapshot).
 - **`orca vm recipe doctor` does not list the recipe.** It cannot see plugin recipes. Create a workspace to test.
